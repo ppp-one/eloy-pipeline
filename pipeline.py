@@ -78,8 +78,8 @@ warnings.filterwarnings("ignore", message="You are sending unauthenticated reque
 # --- Detection / photometry parameters -------------------------------------
 N_STARS = 100  # number of stars to track for photometry
 CUTOUT_SHAPE = (31, 31)  # cutout size (pixels) used for PSF/centroiding
-TRIM = 0  # pixels trimmed from each image edge before processing
-SATURATED = 11000 * 0.9  # peak counts considered saturated after calibration (ADU)
+TRIM = 20  # pixels trimmed from each image edge before processing
+SATURATED = 65000 * 0.9  # peak counts considered saturated after calibration (ADU)
 
 N_STARS_ALIGN = 12  # number of brightest stars used to solve frame alignment
 RELATIVE_RADII = np.linspace(0.5, 5, 40)  # aperture radii, in units of FWHM
@@ -920,7 +920,11 @@ def main():
         )
 
     # Master bias is filter-independent; build it once for the night.
-    bias = override_bias if override_bias is not None else observations[day_date][TYPE_BIAS]
+    bias = (
+        override_bias
+        if override_bias is not None
+        else observations[day_date][TYPE_BIAS]
+    )
     if override_bias is not None:
         logger.info("Using %d bias frames from --bias-dir.", len(bias))
     BIAS = calibration.master_bias(files=bias)
@@ -959,9 +963,15 @@ def main():
             for f in observations[day_date][TYPE_FLAT]
             if files_meta[f]["filter"] == target_filter
         ]
-        dark_pool = override_darks if override_darks is not None else observations[day_date][TYPE_DARK]
+        dark_pool = (
+            override_darks
+            if override_darks is not None
+            else observations[day_date][TYPE_DARK]
+        )
         dark_meta = dark_dir_meta if override_darks is not None else files_meta
-        matching_darks = [f for f in dark_pool if dark_meta[f]["exptime"] in target_exptimes]
+        matching_darks = [
+            f for f in dark_pool if dark_meta[f]["exptime"] in target_exptimes
+        ]
         if override_darks is not None:
             logger.info(
                 "Using %d dark frames from --dark-dir (%d match target exposure time(s) %s).",
@@ -985,7 +995,9 @@ def main():
             darks = matching_darks
 
         if override_flats is not None:
-            flats = [f for f in override_flats if flat_dir_meta[f]["filter"] == target_filter]
+            flats = [
+                f for f in override_flats if flat_dir_meta[f]["filter"] == target_filter
+            ]
             logger.info(
                 "Using %d '%s' flat frames from --flat-dir.",
                 len(flats),
