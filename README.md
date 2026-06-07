@@ -12,14 +12,16 @@ self-contained interactive HTML report.
 
 1. **Indexes** a directory of FITS files by observing night (noon-to-noon,
    handling runs past midnight), frame type, and target using the `IMAGETYP`,
-   `OBJECT`, `DATE-OBS`, and `FILTER` header keywords.
+   `OBJECT`, `DATE-OBS`, and `FILTER` header keywords. If the target's frames
+   span more than one night, the night with the most frames is reduced.
 
 2. **Builds master calibration frames** — bias, dark (matched to the target's
    exposure time), and flat (matched to the target's filter). Estimates read
    noise from a bias-frame pair and dark current from the master dark.
 
 3. **Sets up the reference frame** using the middle light frame of the night:
-   calibrates it, detects stars (DAOStarFinder), queries Gaia to solve the WCS,
+   calibrates it, detects stars (threshold + morphological opening, sorted by
+   brightness), queries Gaia — or 2MASS for infrared filters — to solve the WCS,
    then resolves the science target's sky coordinates via MAST and identifies
    which detected star it is.
 
@@ -39,18 +41,32 @@ self-contained interactive HTML report.
    metrics (point-to-point scatter and within-bin residual scatter); the target
    light curve is used only as a cross-check.
 
+Finally it writes the photometry and night-report bundles (see **Output**) and
+two diagnostic PDFs: a light-curve figure (target plus each comparison star) and
+a systematics figure (FWHM, sky, centroid drift, airmass).
+
 ### Usage
 
 ```bash
-python pipeline.py \
+uv run pipeline.py \
   --image_path /path/to/night/fits \
   --target "Sp0025+5422" \
-  [--query-name "SP0025+5422"]   # name for MAST/Gaia resolution if different from --target
+  [--query-string "SP0025+5422"] \  # name for MAST coordinate resolution if different from --target
+  [--fix-bad-pixels] \              # interpolate over hot/dead pixels before photometry
+  [--output-dir results/]          # where to write outputs (default: current directory)
 ```
 
 `--image_path` must contain all FITS frames for the night (lights, darks,
 flats, biases). Calibration frames are matched automatically by exposure time
-and filter. `--query-name` defaults to `--target` when omitted.
+and filter.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--image_path` | — | Directory of FITS files for the night. |
+| `--target` | — | `OBJECT` header value of the science target. |
+| `--query-string` | same as `--target` | Name resolved via MAST for the target's sky coordinates. Use when the `OBJECT` value isn't resolvable. |
+| `--fix-bad-pixels` | off | Build a hot/dead-pixel mask from the dark frames and interpolate flagged pixels (plus negatives and above-full-well pixels) from their valid neighbours before photometry. |
+| `--output-dir` | `.` (current dir) | Directory for all outputs (npz bundles and PDFs); created if it doesn't exist. |
 
 ### Output
 
@@ -99,7 +115,7 @@ Reads the `night_report_...npz` bundle and writes a self-contained HTML file
 ### Usage
 
 ```bash
-python night_report.py night_report_<telescope>_<filter>_<target>_<date>.npz \
+uv run night_report.py night_report_<telescope>_<filter>_<target>_<date>.npz \
   [-o report.html] \
   [--fps 15] \
   [--platescale 0.348]

@@ -22,7 +22,7 @@ import math
 import os
 import threading
 import warnings
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import timedelta
 from glob import glob
@@ -124,7 +124,7 @@ def find_files(glob_pattern: str) -> list[str]:
         files_meta: dict ``{file path: {date, datetime, type, object, filter,
         exptime}}``.
     """
-    files_meta = defaultdict(dict)
+    files_meta = {}
     observations = defaultdict(lambda: defaultdict(list))
 
     logger.info("Finding files for pattern '%s'...", glob_pattern)
@@ -138,23 +138,22 @@ def find_files(glob_pattern: str) -> list[str]:
         image_type = header.get(KW_IMAGETYP, "unknown")
         object_name = header.get(KW_OBJECT, image_type)
         filter_name = header.get(KW_FILTER, "unknown")
-        site_lat = header.get(KW_LONGITUDE, 0)
+        site_lon = header.get(KW_LONGITUDE, 0)
 
-        # because some observations are taken over midnight
-        day_date = file_date + timedelta(hours=site_lat / 15 - 12)
+        # Shift the UTC timestamp to the local noon-to-noon "observing night" so
+        # frames taken either side of local midnight share one date. longitude/15
+        # converts degrees east to an hour offset; -12 anchors the rollover at noon.
+        night_date = (file_date + timedelta(hours=site_lon / 15 - 12)).date()
 
-        # for speculoos the type would be in header[KW_IMAGETYP]
-        files_meta[file].update(
-            {
-                "date": day_date.date(),
-                "datetime": file_date,
-                "type": image_type,
-                "object": object_name,
-                "filter": filter_name,
-                "exptime": exptime,
-            }
-        )
-        observations[day_date.date()][files_meta[file]["type"]].append(file)
+        files_meta[file] = {
+            "date": night_date,
+            "datetime": file_date,
+            "type": image_type,
+            "object": object_name,
+            "filter": filter_name,
+            "exptime": exptime,
+        }
+        observations[night_date][image_type].append(file)
 
     # sort the files by datetime
     for date in observations:
@@ -170,28 +169,22 @@ def find_files(glob_pattern: str) -> list[str]:
 def bad_pixel_map(dark_files, master_bias=None, std_factor_upper=3, std_factor_lower=3):
     """Build a bad-pixel mask from the individual matching dark frames.
 
-    Replicates the validated SPECULOOS detection logic: each dark frame is
-    bias-subtracted and normalised to ADU/s, then the per-pixel median across
-    all frames is taken as the master dark.  Pixels that deviate from the
-    global median by more than N standard deviations are flagged:
+    Each dark frame is bias-subtracted and normalised to ADU/s, then the
+    per-pixel median across all frames is taken as the master dark. Pixels that
+    deviate from the global median by more than N standard deviations are flagged
+    as hot (``> median + std_factor_upper * std``) or dead
+    (``< median - std_factor_lower * std``). Plain ``np.std`` / ``np.median`` are
+    used (no sigma-clipping) to match the reference SPECULOOS implementation.
 
-    * **Hot pixels**  — ``master_dark > median + std_factor_upper * std``
-    * **Dead pixels** — ``master_dark < median - std_factor_lower * std``
+    Args:
+        dark_files: Paths to the individual dark FITS files.
+        master_bias: Bias frame subtracted from each dark before normalisation,
+            or ``None`` to skip bias subtraction.
+        std_factor_upper: Hot-pixel threshold, in standard deviations.
+        std_factor_lower: Dead-pixel threshold, in standard deviations.
 
-    Plain ``np.std`` / ``np.median`` are used (no sigma-clipping) to stay
-    faithful to the reference implementation.
-
-    Parameters
-    ----------
-    dark_files        : list of str  — paths to the individual dark FITS files
-    master_bias       : 2-D ndarray or None  — subtracted from each dark before
-                        normalisation; pass ``None`` to skip bias subtraction
-    std_factor_upper  : float  — hot-pixel threshold  (default 3)
-    std_factor_lower  : float  — dead-pixel threshold (default 3)
-
-    Returns
-    -------
-    mask : bool ndarray  (True = bad pixel)
+    Returns:
+        Boolean mask the shape of one frame (``True`` = bad pixel).
     """
     logger.info("Building bad-pixel map from %d dark frame(s)", len(dark_files))
 
@@ -236,24 +229,21 @@ def interpolate_bad_pixels(image, mask, max_adu=None):
     """Replace bad pixels with the mean of their valid cardinal neighbours.
 
     Marks bad pixels, unphysical negatives, and pixels above the camera's
-    physical maximum (``max_adu``) as NaN, then fills each NaN position with
-    the mean of its four N/S/E/W neighbours.  The working array is updated
-    in-place as each pixel is filled, so pixels on the edge of a cluster can
-    supply values to their still-NaN interior neighbours in the same pass.
+    physical maximum (``max_adu``) as NaN, then fills each NaN position with the
+    mean of its four N/S/E/W neighbours. The working array is updated in-place as
+    each pixel is filled, so pixels on the edge of a cluster can supply values to
+    their still-NaN interior neighbours in the same pass.
 
-    Parameters
-    ----------
-    image   : 2-D ndarray
-    mask    : 2-D bool ndarray  (True = bad, same shape as image)
-    max_adu : float or None
-        Camera full-well / physical maximum in ADU.  Any calibrated pixel
-        above this value is flagged and interpolated over — this catches hot
-        pixels, cosmic rays, and flat divide-by-near-zero artefacts that are
-        not detected by the dark-based bad-pixel mask.
+    Args:
+        image: 2-D image to correct.
+        mask: Boolean mask the same shape as ``image`` (``True`` = bad pixel).
+        max_adu: Camera full-well / physical maximum in ADU, or ``None`` to skip
+            the upper-bound check. Any calibrated pixel above this value is
+            interpolated over, catching hot pixels, cosmic rays, and flat
+            divide-by-near-zero artefacts the dark-based mask misses.
 
-    Returns
-    -------
-    corrected : 2-D float ndarray
+    Returns:
+        The corrected image as a 2-D float array.
     """
     if image.shape != mask.shape:
         raise ValueError(
@@ -384,8 +374,8 @@ def calibration_sequence(
     cutouts = utils.cutout(calibrated_data, region_coords, (50, 50))
 
     # discard saturated stars so they don't bias the PSF or photometry
-    not_saturated = np.array([np.max(c) < SATURATED for c in cutouts])
-    cutouts = np.array([c for c, keep in zip(cutouts, not_saturated) if keep])
+    not_saturated = cutouts.max(axis=(1, 2)) < SATURATED
+    cutouts = cutouts[not_saturated]
     region_coords_filtered = region_coords[not_saturated]
     regions = [r for r, keep in zip(regions, not_saturated) if keep]
 
@@ -671,33 +661,30 @@ def optimal_aperture(
 ) -> int:
     """Select the aperture that minimises noise without penalising variability.
 
-    **Primary decision** — comparison-star noise profile
-        Comparison stars are not astrophysically variable, so their noise vs.
-        aperture gives an uncontaminated view of aperture quality (readnoise-
-        dominated at small apertures, sky-dominated at large ones, optimal in
-        between).  Two metrics are computed for the comparison ensemble at each
-        aperture (PTP scatter and within-bin residual scatter); apertures are
-        ranked on each and the one with the lowest combined rank wins.
+    The decision is driven by the comparison stars, which are not astrophysically
+    variable, so their noise versus aperture gives an uncontaminated view of
+    aperture quality (read-noise-dominated at small apertures, sky-dominated at
+    large ones, optimal in between). Two metrics are computed for the comparison
+    ensemble at each aperture (point-to-point scatter and within-bin residual
+    scatter); apertures are ranked on each and the lowest combined rank wins.
 
-    **Cross-validation** — target scores
-        The same metrics are computed for the target and logged for
-        transparency.  If they strongly disagree with the comparison result a
-        warning is emitted, but the comparison result is kept because the
-        target's own LC may contain real astrophysical signal.
+    The same metrics are computed for the target as a cross-check and logged. If
+    they strongly disagree with the comparison result a warning is emitted, but
+    the comparison result is kept because the target's own light curve may
+    contain real astrophysical signal.
 
-    Parameters
-    ----------
-    diffs:
-        Differential light curves, shape ``(n_apertures, n_stars, n_frames)``.
-    target_index:
-        Column index of the science target in the star axis.
-    time:
-        JD timestamps, shape ``(n_frames,)``.  Need not be sorted.
-    weights:
-        Per-aperture comparison-star weights, shape ``(n_apertures, n_stars)``.
-        Stars with ``weight > 0`` are treated as comparisons.
-    bin_minutes:
-        Width of the time bins used for the within-bin residual metric.
+    Args:
+        diffs: Differential light curves, shape ``(n_apertures, n_stars,
+            n_frames)``.
+        target_index: Column index of the science target in the star axis.
+        time: JD timestamps, shape ``(n_frames,)``. Need not be sorted.
+        weights: Per-aperture comparison-star weights, shape ``(n_apertures,
+            n_stars)``. Stars with ``weight > 0`` are treated as comparisons.
+        bin_minutes: Width of the time bins used for the within-bin residual
+            metric.
+
+    Returns:
+        Index of the chosen aperture along the aperture axis of ``diffs``.
     """
     n_ap, n_stars, _ = diffs.shape
 
@@ -806,32 +793,30 @@ def main():
             "3×3 neighbours."
         ),
     )
+    ap.add_argument(
+        "--output-dir",
+        default=".",
+        metavar="DIR",
+        help="Directory to write output files to (created if needed; default: current directory).",
+    )
     args = ap.parse_args()
     image_path = args.image_path
     target = args.target
     query_string = args.query_string if args.query_string is not None else target
     fix_bad_pixels = args.fix_bad_pixels
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     # =======================================================================
     # Index the night and build master calibration frames
     # =======================================================================
     observations, files_meta = find_files(f"{image_path}/*.fits")
 
-    # Collect the set of exposure times and observing dates seen per object, so
-    # we can match the target to calibrations taken with the same exposure.
-    object_info = defaultdict(lambda: {"exptimes": set(), "dates": set()})
-    for meta in files_meta.values():
-        obj = meta["object"]
-        object_info[obj]["exptimes"].add(meta["exptime"])
-        object_info[obj]["dates"].add(meta["date"])
-
-    # Darks must match the target's exposure time(s) for dark current to scale.
-    target_exptimes = object_info[target]["exptimes"]
-    matching_darks = [
-        f
-        for f, meta in files_meta.items()
-        if meta["type"] == TYPE_DARK and meta["exptime"] in target_exptimes
-    ]
+    # Exposure time(s) the target was observed at. Darks are later matched to
+    # these so the dark current (which scales with exposure time) cancels.
+    target_exptimes = {
+        meta["exptime"] for meta in files_meta.values() if meta["object"] == target
+    }
 
     # Science (light) frames of the target.
     light_frames = [
@@ -839,11 +824,28 @@ def main():
         for f, meta in files_meta.items()
         if meta["type"] == TYPE_LIGHT and meta["object"] == target
     ]
+    if not light_frames:
+        raise ValueError(f"No light frames found for target '{target}'")
     logger.info("Target '%s': %d light frames", target, len(light_frames))
 
-    # Determine the target's filter so flats can be matched to it. A flat-field
-    # correction is only valid for the filter it was taken in, so mixing filters
-    # would corrupt the master flat.
+    # The pipeline reduces one observing night. If the target's frames span
+    # several nights (e.g. a directory holding more than one), keep the night
+    # with the most frames so the selection is deterministic.
+    frames_per_night = Counter(files_meta[f]["date"] for f in light_frames)
+    day_date, _ = frames_per_night.most_common(1)[0]
+    if len(frames_per_night) > 1:
+        logger.warning(
+            "Target light frames span %d nights %s; using %s (most frames) "
+            "and ignoring the rest.",
+            len(frames_per_night),
+            sorted(frames_per_night),
+            day_date,
+        )
+        light_frames = [f for f in light_frames if files_meta[f]["date"] == day_date]
+    logger.info("Observing night: %s", day_date)
+
+    # A flat correction is only valid for the filter it was taken in, so require
+    # the target's frames to share a single filter and match flats to it.
     target_filters = {files_meta[f]["filter"] for f in light_frames}
     if len(target_filters) != 1:
         raise ValueError(
@@ -852,13 +854,19 @@ def main():
     target_filter = target_filters.pop()
     logger.info("Target filter: %s", target_filter)
 
-    # Master calibration frames for the target's observing night. Flats are
-    # restricted to the target's filter; darks/bias are filter-independent.
-    day_date = list(object_info[target]["dates"])[0]
+    # Master calibration frames for the chosen night. Flats are restricted to the
+    # target's filter; darks/bias are filter-independent. Darks are matched to the
+    # target's exposure time(s) where possible, falling back to all of the night's
+    # darks otherwise.
     flats = [
         f
         for f in observations[day_date][TYPE_FLAT]
         if files_meta[f]["filter"] == target_filter
+    ]
+    matching_darks = [
+        f
+        for f in observations[day_date][TYPE_DARK]
+        if files_meta[f]["exptime"] in target_exptimes
     ]
     if not matching_darks:
         logger.warning(
@@ -903,15 +911,13 @@ def main():
         read_noise = float("nan")
         logger.warning("Need at least 2 bias frames to estimate read noise; skipping")
 
-    # Dark current: median pixel value of the bias-subtracted master dark divided
-    # by the dark exposure time, in ADU/s.
+    # Dark current: median pixel value of the master dark, which calibration.
+    # master_dark already returns bias-subtracted and normalised to ADU/s.
     dark_current = float(np.nanmedian(DARK))
     logger.info("Dark current estimate: %.4f ADU/s", dark_current)
 
     # Bad-pixel mask (computed once; passed to every calibration_sequence call).
-    bp_mask = (
-        bad_pixel_map(matching_darks, master_bias=BIAS) if fix_bad_pixels else None
-    )
+    bp_mask = bad_pixel_map(darks, master_bias=BIAS) if fix_bad_pixels else None
     if bp_mask is not None:
         logger.info(
             "Bad-pixel correction enabled: %d pixels flagged (%.2f %%)",
@@ -1047,7 +1053,8 @@ def main():
         target_filter.replace(" ", "-").replace("/", "-").replace("'", "")
     )
     output_file = (
-        f"photometry_data_{telescope_name}_{safe_target_filter}_{target}_{day_date}.npz"
+        output_dir
+        / f"photometry_data_{telescope_name}_{safe_target_filter}_{target}_{day_date}.npz"
     )
     np.savez(
         output_file,
@@ -1087,7 +1094,8 @@ def main():
     # Save the night-report bundle (data + images + movie) for night_report.py
     # =======================================================================
     report_file = (
-        f"night_report_{telescope_name}_{safe_target_filter}_{target}_{day_date}.npz"
+        output_dir
+        / f"night_report_{telescope_name}_{safe_target_filter}_{target}_{day_date}.npz"
     )
     np.savez_compressed(
         report_file,
@@ -1217,7 +1225,7 @@ def main():
         if row == n_rows_comp:
             ax.set_xlabel(f"JD − {jd0}", fontsize=7)
 
-    lc_path = f"lc_{fig_prefix}.pdf"
+    lc_path = output_dir / f"lc_{fig_prefix}.pdf"
     fig1.savefig(lc_path, bbox_inches="tight")
     logger.info("Saved light-curve figure to %s", lc_path)
     plt.close(fig1)
@@ -1323,7 +1331,7 @@ def main():
     for ax in axes2:
         ax.tick_params(labelsize=9)
 
-    syst_path = f"systematics_{fig_prefix}.pdf"
+    syst_path = output_dir / f"systematics_{fig_prefix}.pdf"
     fig2.savefig(syst_path, bbox_inches="tight")
     logger.info("Saved systematics figure to %s", syst_path)
     plt.close(fig2)
