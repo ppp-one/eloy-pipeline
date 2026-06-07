@@ -168,3 +168,7 @@ temp
 .vscode/
 *.fits
 .DS_Store
+*.pdf
+*.npz
+*.html
+*.mp4

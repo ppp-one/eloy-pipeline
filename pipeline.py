@@ -79,19 +79,19 @@ warnings.filterwarnings("ignore", message="You are sending unauthenticated reque
 # --- Detection / photometry parameters -------------------------------------
 N_STARS = 400  # number of stars to track for photometry
 CUTOUT_SHAPE = (31, 31)  # cutout size (pixels) used for PSF/centroiding
-TRIM = 0  # pixels trimmed from each image edge before processing
-SATURATED = 10000 * 0.9  # peak counts above which a star is treated as saturated
+TRIM = 20  # pixels trimmed from each image edge before processing
+SATURATED = 64000 * 0.9  # peak counts above which a star is treated as saturated
 
 N_STARS_ALIGN = 12  # number of brightest stars used to solve frame alignment
 RELATIVE_RADII = np.linspace(0.5, 5, 40)  # aperture radii, in units of FWHM
-MAX_DRIFT_PX = 20  # skip frames whose median alignment drift exceeds this (pixels)
+MAX_DRIFT_PX = 100  # skip frames whose median alignment drift exceeds this (pixels)
 
 N_WORKERS = os.cpu_count() or 4  # worker processes for the parallel main loop
 
 MOVIE_MAX_PX = 512  # longest side of the saved night-movie frames (downsampled)
 DEFAULT_PLATESCALE = 0.348  # arcsec/pixel, fallback when optics keywords absent
 
-USE_TMASS = True  # whether to query 2MASS for WCS-solving reference stars (else Gaia)
+USE_TMASS = False  # whether to query 2MASS for WCS-solving reference stars (else Gaia)
 
 # --- FITS header keywords --------------------------------------------------
 KW_DATE_OBS = "DATE-OBS"  # UTC timestamp of the exposure
@@ -142,7 +142,7 @@ def find_files(glob_pattern: str) -> list[str]:
         image_type = header.get(KW_IMAGETYP, "unknown")
         object_name = header.get(KW_OBJECT, image_type)
         filter_name = header.get(KW_FILTER, "unknown")
-        site_lat = header.get(KW_LONGITUDE, np.nan)
+        site_lat = header.get(KW_LONGITUDE, 0)
 
         # because some observations are taken over midnight
         day_date = file_date + timedelta(hours=site_lat / 15 - 12)
@@ -164,6 +164,9 @@ def find_files(glob_pattern: str) -> list[str]:
     for date in observations:
         for obs_type in observations[date]:
             observations[date][obs_type].sort(key=lambda f: files_meta[f]["datetime"])
+
+    # sort files_meta by datetime too, for easier debugging
+    files_meta = dict(sorted(files_meta.items(), key=lambda item: item[1]["datetime"]))
 
     return observations, files_meta
 
@@ -442,7 +445,8 @@ def calibration_sequence(
                 n_pre_nan,
                 n_post_nan,
             )
-    # calibrated_data = calibrated_data[TRIM:-TRIM, TRIM:-TRIM]
+    if TRIM > 0:
+        calibrated_data = calibrated_data[TRIM:-TRIM, TRIM:-TRIM]
 
     regions = detection.stars_detection(calibrated_data)
 
@@ -610,9 +614,14 @@ def _process_frames(files, progress_q=None):
                 ref_coords_all[0:N_STARS_ALIGN],
                 ref_reference,
             )
-            transform = AffineTransform(R).inverse
+            # rotation_matrix returns R mapping reference -> this frame, so apply
+            # it forward (NOT .inverse) to project the reference positions into
+            # this frame. Using .inverse placed apertures at ref - drift instead
+            # of ref + drift, i.e. off by 2x the drift, which broke photometry on
+            # any drifted frame while looking fine on perfectly-aligned ones.
+            transform = AffineTransform(R)
             aligned_coords = transform(ref_coords)[0:N_STARS]
-            dx, dy = np.median(ref_coords[0:N_STARS] - aligned_coords, 0)
+            dx, dy = np.median(aligned_coords - ref_coords[0:N_STARS], 0)
 
             drift = float(np.sqrt(dx**2 + dy**2))
             if drift > MAX_DRIFT_PX:
@@ -620,7 +629,11 @@ def _process_frames(files, progress_q=None):
                     "Skipping %s: drift %.1f px (dx=%.1f dy=%.1f) exceeds "
                     "MAX_DRIFT_PX=%d — frame is too misaligned for reliable "
                     "aperture photometry",
-                    filename, drift, dx, dy, MAX_DRIFT_PX,
+                    filename,
+                    drift,
+                    dx,
+                    dy,
+                    MAX_DRIFT_PX,
                 )
                 continue
 
@@ -723,6 +736,128 @@ def _bin_residual_score(lc: np.ndarray, t: np.ndarray, bin_minutes: float) -> fl
     if not residuals:
         return np.inf
     return float(np.std(np.concatenate(residuals)))
+
+
+def _fallback_auto_diff(
+    fluxes: np.ndarray, target_index: int | None
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute differential photometry without relying on eloy's 2D helper.
+
+    The installed ``eloy.flux.auto_diff`` currently fails on a single aperture's
+    ``(stars, frames)`` slice because its internal weight helper assumes an
+    extra leading aperture axis. This fallback keeps the same I/O contract and
+    uses inverse white-noise weighting when available, else uniform comparison
+    weights so perfectly constant synthetic light curves still reduce cleanly.
+    """
+    flux_array = np.asarray(fluxes, dtype=float)
+    squeeze_result = flux_array.ndim == 2
+    if squeeze_result:
+        flux_array = flux_array[None, ...]
+    if flux_array.ndim != 3:
+        raise ValueError(
+            "Differential photometry expects fluxes with shape "
+            "(apertures, stars, frames) or (stars, frames)"
+        )
+
+    n_apertures, n_stars, _ = flux_array.shape
+    diffs = np.full_like(flux_array, np.nan, dtype=float)
+    weights = np.zeros((n_apertures, n_stars), dtype=float)
+
+    for ap in range(n_apertures):
+        aperture_fluxes = flux_array[ap]
+        mean_flux = np.nanmean(aperture_fluxes, axis=-1, keepdims=True)
+        norm_flux = aperture_fluxes / np.where(mean_flux == 0, np.nan, mean_flux)
+
+        comp_mask = np.all(np.isfinite(norm_flux), axis=-1)
+        if target_index is not None:
+            comp_mask[target_index] = False
+
+        comp_indices = np.flatnonzero(comp_mask)
+        if len(comp_indices) == 0:
+            logger.warning(
+                "Aperture %d: no valid comparison stars for differential photometry; "
+                "using normalized fluxes.",
+                ap,
+            )
+            diffs[ap] = norm_flux
+            continue
+
+        scatter = np.nanstd(norm_flux[comp_indices], axis=-1)
+        good_scatter = np.isfinite(scatter) & (scatter > 0)
+        if np.any(good_scatter):
+            inv_scatter = 1.0 / scatter[good_scatter]
+            ap_weights = inv_scatter / np.sum(inv_scatter)
+            weights[ap, comp_indices[good_scatter]] = ap_weights
+        else:
+            weights[ap, comp_indices] = 1.0 / len(comp_indices)
+
+        time_weights = weights[ap, :, None] * np.isfinite(norm_flux)
+        artificial = np.nansum(norm_flux * weights[ap, :, None], axis=0) / np.where(
+            np.sum(time_weights, axis=0) == 0,
+            np.nan,
+            np.sum(time_weights, axis=0),
+        )
+        diffs[ap] = norm_flux / artificial[None, :]
+
+    if squeeze_result:
+        return diffs[0], weights[0]
+    return diffs, weights
+
+
+def safe_auto_diff(
+    fluxes: np.ndarray, target_index: int | None
+) -> tuple[np.ndarray, np.ndarray]:
+    """Run ``eloy.flux.auto_diff`` with shape/quality guards and a fallback."""
+    flux_array = np.asarray(fluxes)
+
+    # The installed eloy release iterates over aperture slices and then calls a
+    # helper that mishandles 2D ``(stars, frames)`` inputs. Skip that path for
+    # the aperture cube this pipeline produces.
+    if flux_array.ndim == 3:
+        logger.warning(
+            "eloy.flux.auto_diff does not support 3D inputs; using local fallback."
+        )
+        return _fallback_auto_diff(flux_array, target_index)
+
+    try:
+        diffs, weights = flux.auto_diff(fluxes, target_index)
+    except Exception as exc:
+        logger.warning(
+            "eloy.flux.auto_diff failed (%s: %s); using local fallback.",
+            type(exc).__name__,
+            exc,
+        )
+        return _fallback_auto_diff(fluxes, target_index)
+
+    diffs = np.asarray(diffs, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+
+    expected_weights_shape = flux_array.shape[:-1]
+    if weights.shape != expected_weights_shape:
+        logger.warning(
+            "eloy.flux.auto_diff returned weights with shape %s; expected %s. "
+            "Using local fallback.",
+            weights.shape,
+            expected_weights_shape,
+        )
+        return _fallback_auto_diff(fluxes, target_index)
+
+    if target_index is not None:
+        comp_weights = weights.copy()
+        comp_weights[..., target_index] = 0
+    else:
+        comp_weights = weights
+
+    bad_weights = np.any(~np.isfinite(weights))
+    missing_comps = np.any(np.nansum(np.clip(comp_weights, 0, None), axis=-1) <= 0)
+    if bad_weights or missing_comps or not np.all(np.isfinite(diffs)):
+        logger.warning(
+            "eloy.flux.auto_diff returned unusable weights/differential fluxes; "
+            "using local fallback.",
+        )
+        return _fallback_auto_diff(fluxes, target_index)
+
+    return diffs, weights
 
 
 def optimal_aperture(
@@ -987,7 +1122,7 @@ def main():
     # =======================================================================
     # Use the middle frame of the night as the alignment/astrometry reference.
     reference_image = light_frames[len(light_frames) // 2]
-    logger.info("Using reference image: %s", Path(reference_image).name)
+    logger.info("Using reference image: %s", Path(reference_image))
 
     ref_data, ref_coords, ref_coords_all, ref_fwhm, _, _ = calibration_sequence(
         reference_image, DARK, FLAT, BIAS, bp_mask, max_adu=SATURATED
@@ -1109,7 +1244,7 @@ def main():
     fluxes = (data["fluxes"] - data["bkg"]).T
 
     # Differential photometry against an automatically-chosen comparison set.
-    diffs, weights = flux.auto_diff(fluxes, target_index)
+    diffs, weights = safe_auto_diff(fluxes, target_index)
 
     # Pick the aperture that minimises the target's light-curve scatter.
     best_aperture = optimal_aperture(
