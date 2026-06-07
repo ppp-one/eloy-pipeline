@@ -172,3 +172,4 @@ temp
 *.npz
 *.html
 *.mp4
+results/

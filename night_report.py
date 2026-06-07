@@ -1,8 +1,8 @@
 """Build an interactive night-report web page from a pipeline report bundle.
 
 Reads the ``night_report_<target>_<date>.npz`` produced by ``pipeline.py`` and
-writes a single self-contained HTML file that shows, in the style of the
-SPECULOOS portal:
+writes an HTML page (plus a sibling ``*_assets`` folder holding the movie and
+stack PNGs it references) that shows, in the style of the SPECULOOS portal:
 
   * the co-added stack with the target/comparison stars overlaid, plus buttons
     to switch to the master flat/dark/bias frames;
@@ -10,19 +10,16 @@ SPECULOOS portal:
     hover the light curve;
   * the target differential light curve (raw + binned);
   * a systematics panel with a dropdown (fwhm, sky, dx, dy, airmass, and the
-    comparison-star light curves);
-  * diagnostic flags (airmass, sky, fwhm, saturation).
+    comparison-star light curves).
 
 The page renders with plotly.js loaded from a CDN, so no Python plotting library
 is required.
 
 Usage:
-    python night_report.py night_report_<target>_<date>.npz [-o report.html]
+    uv run night_report.py night_report_<target>_<date>.npz [-o report.html]
 """
 
 import argparse
-import base64
-import io
 import json
 import logging
 import math
@@ -80,8 +77,8 @@ def stretch(image):
     return np.nan_to_num(norm, nan=0.0)  # non-finite pixels -> black
 
 
-def png_data_uri(image, max_px=2048, step=None):
-    """Downsample + stretch an image to a PNG data URI; return (uri, stride).
+def write_png(image, path, max_px=2048, step=None):
+    """Downsample + stretch an image and save it as a PNG; return the stride used.
 
     Pass ``step`` to force a specific downsampling factor (useful to make all
     frames share the same coordinate system). Otherwise the step is derived
@@ -91,9 +88,8 @@ def png_data_uri(image, max_px=2048, step=None):
     if step is None:
         step = max(1, int(np.ceil(max(image.shape) / max_px)))
     arr = (stretch(image[::step, ::step]) * 255).astype(np.uint8)
-    buf = io.BytesIO()
-    PILImage.fromarray(arr).save(buf, format="PNG")
-    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode(), step
+    PILImage.fromarray(arr).save(path, format="PNG")
+    return step
 
 
 def bin_time(t, y, window_min=10):
@@ -198,13 +194,16 @@ def circle_shapes(coords, indices, radius, target_index, selected=None):
     return shapes
 
 
-def image_figure(d, n_stars, comps, target_index, init_radius):
+def image_figure(d, n_stars, comps, target_index, init_radius, asset_dir, asset_rel):
     """Stack + master frames with a single hoverable star-overlay trace.
 
     Returns initial traces/layout for the best aperture; the JS controller
     resizes the aperture circles and toggles the master frames on the client.
     All frames (stack, flat, dark, bias) are cropped to the stack's shape and
     encoded at the same stride so they share an identical coordinate system.
+
+    Each frame is written as a PNG into ``asset_dir`` and referenced by the
+    relative URL ``asset_rel`` so it loads from disk instead of bloating the HTML.
     """
     coords = np.asarray(d["ref_coords"])[:n_stars]
     xs, ys = coords[:, 0].tolist(), coords[:, 1].tolist()
@@ -232,11 +231,11 @@ def image_figure(d, n_stars, comps, target_index, init_radius):
         ("dark", "master_dark"),
         ("bias", "master_bias"),
     ]:
-        uri, _ = png_data_uri(_crop_to_stack(d[key]), step=shared_step)
+        write_png(_crop_to_stack(d[key]), asset_dir / f"{name}.png", step=shared_step)
         images.append(
             {
                 "type": "image",
-                "source": uri,
+                "source": f"{asset_rel}/{name}.png",
                 "x0": 0,
                 "y0": 0,
                 "dx": shared_step,
@@ -485,16 +484,16 @@ def app_payload(
 # ---------------------------------------------------------------------------
 
 
-def render_html(meta, img_fig, lc_fig, app, movie_b64):
+def render_html(meta, img_fig, lc_fig, app, movie_src):
     video_html = (
         f'<video id="vid" muted playsinline preload="auto" '
-        f'src="data:video/mp4;base64,{movie_b64}"></video>'
-        if movie_b64
+        f'src="{movie_src}"></video>'
+        if movie_src
         else '<div class="novideo">No movie available</div>'
     )
     movie_tab = (
         '<span class="tab-btn" id="movieBtn" data-k="movie" onclick="toggleMovie()">&#9654; Movie</span>'
-        if movie_b64
+        if movie_src
         else ""
     )
     img_tabs = (
@@ -1255,6 +1254,13 @@ input[type=number]:focus {{ border-color: #bababa; box-shadow: 0 0 0 2px rgba(18
 # ---------------------------------------------------------------------------
 def build_report(npz_path, out_html=None, fps=15, platescale=None, crf=28, keyint=1):
     npz_path = Path(npz_path)
+    out_html = Path(out_html) if out_html else npz_path.with_suffix(".html")
+    # The movie and stack images are written here and referenced by relative URL,
+    # so the HTML stays small instead of carrying everything as base64.
+    asset_dir = out_html.with_name(out_html.stem + "_assets")
+    asset_rel = asset_dir.name
+    asset_dir.mkdir(parents=True, exist_ok=True)
+
     d = dict(np.load(npz_path, allow_pickle=True))
     if platescale is None:
         platescale = float(d["platescale"]) if "platescale" in d else DEFAULT_PLATESCALE
@@ -1284,23 +1290,24 @@ def build_report(npz_path, out_html=None, fps=15, platescale=None, crf=28, keyin
         ap_radii_per_ap = [6.0] * diffs.shape[0]
     coords = np.asarray(d["ref_coords"])[:n_stars].tolist()
 
-    # Movie -> mp4 (sibling file) + base64 for embedding. Reorder frames into
-    # chronological order so the light-curve hover scrub lines up with the video
-    # (frames are stored in light-frame order, which need not be time-sorted).
-    stem = npz_path.stem.replace("night_report_", "")
-    mp4_path = npz_path.with_name(f"night_movie_{stem}.mp4")
+    # Movie -> mp4 in the asset dir, referenced by relative URL. Reorder frames
+    # into chronological order so the light-curve hover scrub lines up with the
+    # video (frames are stored in light-frame order, which need not be sorted).
+    mp4_path = asset_dir / "movie.mp4"
     movie = d.get("movie")
     if movie is not None and np.asarray(movie).shape[0] == len(d["time"]):
         movie = np.asarray(movie)[np.argsort(np.asarray(d["time"], float))]
     movie_bytes = encode_movie(movie, mp4_path, fps, crf=crf, keyint=keyint)
-    movie_b64 = base64.b64encode(movie_bytes).decode() if movie_bytes else ""
+    movie_src = f"{asset_rel}/movie.mp4" if movie_bytes else ""
     if movie_bytes:
-        logger.info("Wrote movie %s (%.1f MB)", mp4_path.name, len(movie_bytes) / 1e6)
+        logger.info("Wrote movie %s (%.1f MB)", mp4_path, len(movie_bytes) / 1e6)
 
     weights = np.asarray(d["weights"])
     alc = compute_alc(d, diffs, weights)
 
-    img_fig = image_figure(d, n_stars, comps, target_index, ap_radii_per_ap[best])
+    img_fig = image_figure(
+        d, n_stars, comps, target_index, ap_radii_per_ap[best], asset_dir, asset_rel
+    )
     lc_fig, t_range = lightcurve_figure(d, best, target_index, platescale=platescale)
     t_min, t_max, jd0 = t_range
     app = app_payload(
@@ -1338,10 +1345,11 @@ def build_report(npz_path, out_html=None, fps=15, platescale=None, crf=28, keyin
         "telescope": telescope,
     }
 
-    html = render_html(meta, img_fig, lc_fig, app, movie_b64)
-    out_html = Path(out_html) if out_html else npz_path.with_suffix(".html")
+    html = render_html(meta, img_fig, lc_fig, app, movie_src)
     out_html.write_text(html)
-    logger.info("Wrote report %s (%.1f MB)", out_html, len(html) / 1e6)
+    logger.info(
+        "Wrote report %s (%.2f MB) + assets in %s/", out_html, len(html) / 1e6, asset_rel
+    )
     return out_html
 
 
