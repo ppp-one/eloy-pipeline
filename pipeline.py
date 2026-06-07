@@ -78,12 +78,12 @@ warnings.filterwarnings("ignore", message="You are sending unauthenticated reque
 # --- Detection / photometry parameters -------------------------------------
 N_STARS = 100  # number of stars to track for photometry
 CUTOUT_SHAPE = (31, 31)  # cutout size (pixels) used for PSF/centroiding
-TRIM = 20  # pixels trimmed from each image edge before processing
-SATURATED = 64000 * 0.9  # peak counts considered saturated after calibration (ADU)
+TRIM = 0  # pixels trimmed from each image edge before processing
+SATURATED = 11000 * 0.9  # peak counts considered saturated after calibration (ADU)
 
 N_STARS_ALIGN = 12  # number of brightest stars used to solve frame alignment
 RELATIVE_RADII = np.linspace(0.5, 5, 40)  # aperture radii, in units of FWHM
-MAX_DRIFT_PX = 100  # skip frames whose median alignment drift exceeds this (pixels)
+MAX_DRIFT_PX = 20  # skip frames whose median alignment drift exceeds this (pixels)
 
 N_WORKERS = os.cpu_count() or 4  # worker processes for the parallel main loop
 
@@ -808,6 +808,36 @@ def main():
         help="Directory to write output files to (created if needed; default: current directory).",
     )
     ap.add_argument(
+        "--flat-dir",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Directory containing flat frames that override those from image_path.  "
+            "Only FITS files whose IMAGETYP header identifies them as flat frames and "
+            "whose FILTER header matches the target filter are accepted."
+        ),
+    )
+    ap.add_argument(
+        "--dark-dir",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Directory containing dark frames that override those from image_path.  "
+            "Only FITS files whose IMAGETYP header identifies them as dark frames are "
+            "accepted; exposure-time matching is still applied."
+        ),
+    )
+    ap.add_argument(
+        "--bias-dir",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Directory containing bias frames that override those from image_path.  "
+            "Only FITS files whose IMAGETYP header identifies them as bias frames are "
+            "accepted."
+        ),
+    )
+    ap.add_argument(
         "--report",
         action="store_true",
         default=False,
@@ -821,16 +851,37 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Index override calibration directories once, if supplied.
+    if args.flat_dir:
+        _obs, flat_dir_meta = find_files(f"{args.flat_dir}/*.fits")
+        override_flats = [f for d in _obs.values() for f in d.get(TYPE_FLAT, [])]
+        if not override_flats:
+            logger.warning("--flat-dir '%s' contains no flat frames.", args.flat_dir)
+    else:
+        override_flats = None
+        flat_dir_meta = {}
+
+    if args.dark_dir:
+        _obs, dark_dir_meta = find_files(f"{args.dark_dir}/*.fits")
+        override_darks = [f for d in _obs.values() for f in d.get(TYPE_DARK, [])]
+        if not override_darks:
+            logger.warning("--dark-dir '%s' contains no dark frames.", args.dark_dir)
+    else:
+        override_darks = None
+        dark_dir_meta = {}
+
+    if args.bias_dir:
+        _obs, bias_dir_meta = find_files(f"{args.bias_dir}/*.fits")
+        override_bias = [f for d in _obs.values() for f in d.get(TYPE_BIAS, [])]
+        if not override_bias:
+            logger.warning("--bias-dir '%s' contains no bias frames.", args.bias_dir)
+    else:
+        override_bias = None
+
     # =======================================================================
     # Index the night and build master calibration frames
     # =======================================================================
     observations, files_meta = find_files(f"{image_path}/*.fits")
-
-    # Exposure time(s) the target was observed at. Darks are later matched to
-    # these so the dark current (which scales with exposure time) cancels.
-    target_exptimes = {
-        meta["exptime"] for meta in files_meta.values() if meta["object"] == target
-    }
 
     # Science (light) frames of the target.
     light_frames = [
@@ -858,64 +909,23 @@ def main():
         light_frames = [f for f in light_frames if files_meta[f]["date"] == day_date]
     logger.info("Observing night: %s", day_date)
 
-    # A flat correction is only valid for the filter it was taken in, so require
-    # the target's frames to share a single filter and match flats to it.
-    target_filters = {files_meta[f]["filter"] for f in light_frames}
-    if len(target_filters) != 1:
-        raise ValueError(
-            f"Expected target light frames in a single filter, found {target_filters}"
-        )
-    target_filter = target_filters.pop()
-    logger.info("Target filter: %s", target_filter)
-
-    # Master calibration frames for the chosen night. Flats are restricted to the
-    # target's filter; darks/bias are filter-independent. Darks are matched to the
-    # target's exposure time(s) where possible, falling back to all of the night's
-    # darks otherwise.
-    flats = [
-        f
-        for f in observations[day_date][TYPE_FLAT]
-        if files_meta[f]["filter"] == target_filter
-    ]
-    matching_darks = [
-        f
-        for f in observations[day_date][TYPE_DARK]
-        if files_meta[f]["exptime"] in target_exptimes
-    ]
-    if not matching_darks:
-        logger.warning(
-            "No dark frames with matching exposure time(s) %s found for target; "
-            "using all dark frames for this night.",
-            target_exptimes,
-        )
-        darks = observations[day_date][TYPE_DARK]
-    else:
+    # Determine all filters present in the chosen night's light frames.
+    target_filters = sorted({files_meta[f]["filter"] for f in light_frames})
+    if len(target_filters) > 1:
         logger.info(
-            "%d dark frames with matching exposure time(s) %s found for target.",
-            len(matching_darks),
-            target_exptimes,
-        )
-        darks = matching_darks
-    bias = observations[day_date][TYPE_BIAS]
-
-    if not flats:
-        raise ValueError(
-            f"No '{target_filter}' flat frames found for {day_date}; cannot build master flat"
+            "Found %d filters %s for target '%s'; running the pipeline once per filter.",
+            len(target_filters),
+            target_filters,
+            target,
         )
 
-    logger.info(
-        "Building master frames (%d bias, %d dark, %d flat in '%s')",
-        len(bias),
-        len(darks),
-        len(flats),
-        target_filter,
-    )
+    # Master bias is filter-independent; build it once for the night.
+    bias = override_bias if override_bias is not None else observations[day_date][TYPE_BIAS]
+    if override_bias is not None:
+        logger.info("Using %d bias frames from --bias-dir.", len(bias))
     BIAS = calibration.master_bias(files=bias)
-    DARK = calibration.master_dark(bias=BIAS, files=darks)
-    FLAT = calibration.master_flat(files=flats, dark=DARK, bias=BIAS)
 
-    # Read noise: std(B1 - B2) / sqrt(2) in ADU.
-    # Using a difference of two frames cancels fixed-pattern (bias structure) noise.
+    # Read noise: std(B1 - B2) / sqrt(2) in ADU (filter-independent).
     if len(bias) >= 2:
         b1 = fits.getdata(bias[0]).astype(float)
         b2 = fits.getdata(bias[1]).astype(float)
@@ -925,441 +935,518 @@ def main():
         read_noise = float("nan")
         logger.warning("Need at least 2 bias frames to estimate read noise; skipping")
 
-    # Dark current: median pixel value of the master dark, which calibration.
-    # master_dark already returns bias-subtracted and normalised to ADU/s.
-    dark_current = float(np.nanmedian(DARK))
-    logger.info("Dark current estimate: %.4f ADU/s", dark_current)
+    for target_filter in target_filters:
+        if len(target_filters) > 1:
+            logger.info("--- Processing filter: %s ---", target_filter)
 
-    # Bad-pixel mask (computed once; passed to every calibration_sequence call).
-    bp_mask = bad_pixel_map(darks, master_bias=BIAS) if fix_bad_pixels else None
-    if bp_mask is not None:
+        # Light frames restricted to this filter.
+        filter_light_frames = [
+            f for f in light_frames if files_meta[f]["filter"] == target_filter
+        ]
         logger.info(
-            "Bad-pixel correction enabled: %d pixels flagged (%.2f %%)",
-            int(bp_mask.sum()),
-            100.0 * bp_mask.mean(),
+            "Filter '%s': %d light frames", target_filter, len(filter_light_frames)
         )
 
-    # =======================================================================
-    # Reference frame: detect stars, solve WCS, locate the target
-    # =======================================================================
-    # Use the middle frame of the night as the alignment/astrometry reference.
-    reference_image = light_frames[len(light_frames) // 2]
-    logger.info("Using reference image: %s", Path(reference_image))
+        # Exposure times for this filter's frames (for dark matching).
+        target_exptimes = {files_meta[f]["exptime"] for f in filter_light_frames}
 
-    ref_data, ref_coords, ref_coords_all, ref_fwhm, _, _ = calibration_sequence(
-        reference_image, DARK, FLAT, BIAS, bp_mask, max_adu=SATURATED
-    )
-    ref_reference = alignment.twirl_reference(ref_coords_all[0:N_STARS_ALIGN])
+        # Master calibration frames for the chosen night. Flats are restricted to the
+        # target's filter; darks/bias are filter-independent. Darks are matched to the
+        # target's exposure time(s) where possible, falling back to all of the night's
+        # darks otherwise.
+        flats = [
+            f
+            for f in observations[day_date][TYPE_FLAT]
+            if files_meta[f]["filter"] == target_filter
+        ]
+        dark_pool = override_darks if override_darks is not None else observations[day_date][TYPE_DARK]
+        dark_meta = dark_dir_meta if override_darks is not None else files_meta
+        matching_darks = [f for f in dark_pool if dark_meta[f]["exptime"] in target_exptimes]
+        if override_darks is not None:
+            logger.info(
+                "Using %d dark frames from --dark-dir (%d match target exposure time(s) %s).",
+                len(dark_pool),
+                len(matching_darks),
+                target_exptimes,
+            )
+        if not matching_darks:
+            logger.warning(
+                "No dark frames with matching exposure time(s) %s found; "
+                "using all available dark frames.",
+                target_exptimes,
+            )
+            darks = dark_pool
+        else:
+            logger.info(
+                "%d dark frames with matching exposure time(s) %s found for target.",
+                len(matching_darks),
+                target_exptimes,
+            )
+            darks = matching_darks
 
-    # Compute a WCS by matching detected stars to a Gaia query of the field.
-    ref_header = fits.getheader(reference_image)
-    pixel_scale = extract_plate_scale(ref_header)  # plate scale in degrees/pixel
-    fov = ref_data.shape[1] * pixel_scale  # field-of-view width in degrees
-    center = SkyCoord(ref_header[KW_RA], ref_header[KW_DEC], unit="deg")
-    logger.info("Plate scale: %.4f arcsec/pixel", pixel_scale * 3600)
+        if override_flats is not None:
+            flats = [f for f in override_flats if flat_dir_meta[f]["filter"] == target_filter]
+            logger.info(
+                "Using %d '%s' flat frames from --flat-dir.",
+                len(flats),
+                target_filter,
+            )
+        if not flats:
+            raise ValueError(
+                f"No '{target_filter}' flat frames found for {day_date}; cannot build master flat"
+            )
 
-    # Query Gaia over a slightly larger area than the FOV to allow for pointing error.
-    logger.info("Querying Gaia and solving WCS...")
-    use_tmass = False
-    if target_filter in ["zYJ", "Y", "J", "H", "Ks"]:
-        use_tmass = True
-        logger.info("Target filter is '%s'; using 2MASS for WCS fit", target_filter)
-    all_radecs = gaia_radecs(
-        center,
-        1.5 * fov,
-        tmass=use_tmass,
-    )
-    # Match the 15 brightest detected stars to the 15 brightest Gaia sources.
-    wcs = compute_wcs(ref_coords_all[0:15], all_radecs[0:15], tolerance=10)
-
-    # Check if platescale from WCS is consistent with optics keywords
-    wcs_h = wcs.to_header()  # ensure cdelt and pc are populated
-    wcs_platescale = np.abs(
-        wcs_h["CDELT1"] * wcs_h["PC1_1"]
-    )  # degrees/pixel -> arcsec/pixel
-    logger.info("WCS plate scale: %.4f arcsec/pixel", wcs_platescale * 3600)
-    if abs(wcs_platescale - pixel_scale) / (pixel_scale) > 0.1:
-        logger.error(
-            "WCS plate scale %.4f arcsec/pixel differs from optics-derived "
-            "plate scale %.4f arcsec/pixel by more than 10%%;",
-            wcs_platescale * 3600,
-            pixel_scale * 3600,
+        logger.info(
+            "Building master frames (%d dark, %d flat in '%s')",
+            len(darks),
+            len(flats),
+            target_filter,
         )
-        exit(1)
+        DARK = calibration.master_dark(bias=BIAS, files=darks)
+        FLAT = calibration.master_flat(files=flats, dark=DARK, bias=BIAS)
 
-    # Convert reference-frame star pixel positions to sky coordinates via the
-    # WCS, resolve the target's Gaia coordinates, and find which star it is.
-    stars_radec = wcs.pixel_to_world(*ref_coords.T)
+        # Dark current: median pixel value of the master dark, which calibration.
+        # master_dark already returns bias-subtracted and normalised to ADU/s.
+        dark_current = float(np.nanmedian(DARK))
+        logger.info("Dark current estimate: %.4f ADU/s", dark_current)
 
-    mast = Mast()
-    target_radec = mast.resolve_object(query_string)
-    target_index = int(target_radec.match_to_catalog_sky(stars_radec)[0])
-    logger.info("Target matched to star index %d", target_index)
+        # Bad-pixel mask (computed per filter; passed to every calibration_sequence call).
+        bp_mask = bad_pixel_map(darks, master_bias=BIAS) if fix_bad_pixels else None
+        if bp_mask is not None:
+            logger.info(
+                "Bad-pixel correction enabled: %d pixels flagged (%.2f %%)",
+                int(bp_mask.sum()),
+                100.0 * bp_mask.mean(),
+            )
 
-    # =======================================================================
-    # Main loop: per-frame photometry, parallelised across worker processes
-    # =======================================================================
-    stack = np.zeros_like(ref_data, dtype=float)  # co-added, aligned science stack
-    data = defaultdict(list)  # per-frame measurements, keyed by quantity
-    movie = []  # downsampled uint8 frames (frame order), for the night movie
+        # =======================================================================
+        # Reference frame: detect stars, solve WCS, locate the target
+        # =======================================================================
+        # Use the middle frame of the night as the alignment/astrometry reference.
+        reference_image = filter_light_frames[len(filter_light_frames) // 2]
+        logger.info("Using reference image: %s", Path(reference_image))
 
-    chunks = _chunks(light_frames, N_WORKERS)
-    logger.info(
-        "Processing %d frames across %d workers...", len(light_frames), len(chunks)
-    )
-    # Per-frame progress: workers signal this queue once per frame (success,
-    # skip, or error). A drain thread reads it and updates tqdm independently
-    # of when whole chunks complete, giving smooth and accurate progress.
-    # Manager().Queue() produces a proxy object that is picklable across the
-    # spawn boundary used by macOS — plain multiprocessing.Queue is not.
-    stop_drain = threading.Event()
-
-    with _MPManager() as _manager, tqdm(total=len(light_frames), unit="frame") as pbar:
-        progress_q = _manager.Queue()
-
-        def _drain():
-            while not stop_drain.is_set():
-                try:
-                    progress_q.get(timeout=0.2)
-                    pbar.update(1)
-                except Exception:
-                    pass
-
-        drain_thread = threading.Thread(target=_drain, daemon=True)
-        drain_thread.start()
-
-        with ProcessPoolExecutor(
-            max_workers=N_WORKERS,
-            initializer=_init_worker,
-            initargs=(
-                DARK,
-                FLAT,
-                BIAS,
-                ref_coords,
-                ref_coords_all,
-                ref_reference,
-                stack.shape,
-                bp_mask,
-            ),
-        ) as pool:
-            futures = [
-                pool.submit(_process_frames, chunk, progress_q) for chunk in chunks
-            ]
-            for future in as_completed(futures):
-                results, partial_stack, thumbs = future.result()
-                stack += partial_stack
-                movie.extend(thumbs)
-                for result in results:
-                    for key, value in result.items():
-                        data[key].append(value)
-
-        stop_drain.set()
-        drain_thread.join(timeout=2)
-
-    # Convert the per-frame lists into stacked arrays for saving/analysis.
-    for k, v in data.items():
-        data[k] = np.array(v)
-    movie = np.array(movie)  # (n_frames, h, w) uint8
-
-    # Persist the raw photometry products for later analysis.
-    telescope_name = ref_header.get(KW_TELESCOP, "unknown")
-    safe_target_filter = (
-        target_filter.replace(" ", "-").replace("/", "-").replace("'", "")
-    )
-    output_file = (
-        output_dir
-        / f"photometry_data_{telescope_name}_{safe_target_filter}_{target}_{day_date}.npz"
-    )
-    np.savez(
-        output_file,
-        platescale=pixel_scale * 3600,
-        read_noise=read_noise,
-        dark_current=dark_current,
-        **data,
-    )
-    logger.info("Saved photometry to %s", output_file)
-
-    # =======================================================================
-    # Differential photometry
-    # =======================================================================
-    # Background-subtracted fluxes, shaped (apertures, stars, frames).
-    fluxes = (data["fluxes"] - data["bkg"]).T
-
-    # Differential photometry against an automatically-chosen comparison set.
-    diffs, weights = flux.auto_diff(fluxes, target_index)
-
-    # Pick the aperture that minimises the target's light-curve scatter.
-    best_aperture = optimal_aperture(
-        diffs, target_index, data["time"], weights, bin_minutes=10.0
-    )
-    logger.info("Best aperture index: %d", best_aperture)
-
-    logger.info("Saving night-report bundle for night_report.py...")
-    # Artificial (comparison) light curve per aperture: the weighted mean of the
-    # normalised comparison fluxes used to detrend the target (Broeg 2005). The
-    # comparison weights differ per aperture, so this is shape (apertures, frames).
-    norm_fluxes = fluxes / np.nanmean(fluxes, axis=-1, keepdims=True)
-    wsum = weights.sum(axis=-1, keepdims=True)
-    alc = np.einsum("as,asf->af", weights, norm_fluxes) / np.where(
-        wsum == 0, np.nan, wsum
-    )
-
-    # =======================================================================
-    # Save the night-report bundle (data + images + movie) for night_report.py
-    # =======================================================================
-    report_file = (
-        output_dir
-        / f"night_report_{telescope_name}_{safe_target_filter}_{target}_{day_date}.npz"
-    )
-    np.savez_compressed(
-        report_file,
-        stack=stack,
-        master_bias=BIAS,
-        master_dark=DARK,
-        master_flat=FLAT,
-        ref_coords=ref_coords,
-        target_index=target_index,
-        diffs=diffs,
-        weights=weights,
-        alc=alc,
-        best_aperture=best_aperture,
-        movie=movie,
-        target=target,
-        date=str(day_date),
-        band=target_filter,
-        telescope=telescope_name,
-        platescale=pixel_scale * 3600,  # arcsec/pixel
-        read_noise=read_noise,
-        dark_current=dark_current,
-        **data,
-    )
-    logger.info(
-        'Saved night-report bundle to %s (visualise with `uv run night_report.py "%s"`)',
-        report_file,
-        report_file,
-    )
-
-    # =======================================================================
-    # Diagnostic figures
-    # =======================================================================
-    fig_prefix = f"{telescope_name}_{safe_target_filter}_{target}_{day_date}"
-    platescale_as = pixel_scale * 3600  # arcsec / pixel
-
-    t_jd = data["time"]
-    jd0 = int(np.floor(t_jd.min()))
-    # Sort into chronological order once; workers return frames in completion
-    # order (as_completed), not observation order.
-    _order = np.argsort(t_jd)
-    t_plot = (t_jd - jd0)[_order]
-
-    target_lc = diffs[best_aperture, target_index][_order]
-    bt_t, by_t, be_t = _bin_lc(t_plot, target_lc)
-
-    # Comparison stars with non-zero weight at the best aperture.
-    comp_idx = [
-        i
-        for i in range(diffs.shape[1])
-        if i != target_index and weights[best_aperture, i] > 0
-    ]
-    w_total = weights[best_aperture, comp_idx].sum() or 1.0
-
-    # ── Figure 1: target LC + comparison star subplots ───────────────────
-    n_comps = len(comp_idx)
-    n_cols = min(4, max(1, n_comps))
-    n_rows_comp = math.ceil(n_comps / n_cols) if n_comps else 0
-
-    fig1 = plt.figure(figsize=(max(8, 3.5 * n_cols), 3.5 + 2.2 * n_rows_comp))
-    gs1 = gridspec.GridSpec(
-        1 + n_rows_comp,
-        n_cols,
-        figure=fig1,
-        height_ratios=[3] + [1.8] * n_rows_comp,
-        hspace=0.45,
-        wspace=0.35,
-    )
-
-    ax_top = fig1.add_subplot(gs1[0, :])
-    ax_top.scatter(
-        t_plot,
-        target_lc,
-        s=4,
-        c="0.65",
-        alpha=0.5,
-        linewidths=0,
-        rasterized=True,
-    )
-    ax_top.errorbar(
-        bt_t,
-        by_t,
-        be_t,
-        fmt="o",
-        ms=5,
-        color="#2166ac",
-        elinewidth=1,
-        capsize=2,
-        label="10-min bins",
-        zorder=3,
-    )
-    ax_top.axhline(1, lw=0.8, ls="--", color="0.45")
-    ax_top.set_ylabel("Diff. flux")
-    ax_top.set_title(
-        f"{target}  ·  {target_filter}  ·  aperture {best_aperture}  ·  {day_date}",
-        fontsize=10,
-    )
-    ax_top.legend(fontsize=8, frameon=False)
-    if n_rows_comp:
-        ax_top.tick_params(labelbottom=False)
-    else:
-        ax_top.set_xlabel(f"JD − {jd0}")
-
-    for k, ci in enumerate(comp_idx):
-        row = 1 + k // n_cols
-        col = k % n_cols
-        ax = fig1.add_subplot(gs1[row, col])
-        lc_c = diffs[best_aperture, ci][_order]
-        bt_c, by_c, be_c = _bin_lc(t_plot, lc_c)
-        ax.scatter(t_plot, lc_c, s=2, c="0.7", alpha=0.4, linewidths=0, rasterized=True)
-        ax.errorbar(
-            bt_c,
-            by_c,
-            be_c,
-            fmt="o",
-            ms=3,
-            color="#d6604d",
-            elinewidth=0.6,
-            capsize=1.5,
-            zorder=3,
+        ref_data, ref_coords, ref_coords_all, ref_fwhm, _, _ = calibration_sequence(
+            reference_image, DARK, FLAT, BIAS, bp_mask, max_adu=SATURATED
         )
-        w_frac = weights[best_aperture, ci] / w_total
-        ax.set_title(f"comp #{ci}  w = {w_frac:.3f}", fontsize=7)
-        ax.set_ylim(0.96, 1.04)
-        ax.tick_params(labelsize=7)
-        if col == 0:
-            ax.set_ylabel("Diff. flux", fontsize=7)
-        if row == n_rows_comp:
-            ax.set_xlabel(f"JD − {jd0}", fontsize=7)
+        ref_reference = alignment.twirl_reference(ref_coords_all[0:N_STARS_ALIGN])
 
-    lc_path = output_dir / f"lc_{fig_prefix}.pdf"
-    fig1.savefig(lc_path, bbox_inches="tight")
-    logger.info("Saved light-curve figure to %s", lc_path)
-    plt.close(fig1)
+        # Compute a WCS by matching detected stars to a Gaia query of the field.
+        ref_header = fits.getheader(reference_image)
+        pixel_scale = extract_plate_scale(ref_header)  # plate scale in degrees/pixel
+        fov = ref_data.shape[1] * pixel_scale  # field-of-view width in degrees
+        center = SkyCoord(ref_header[KW_RA], ref_header[KW_DEC], unit="deg")
+        logger.info("Plate scale: %.4f arcsec/pixel", pixel_scale * 3600)
 
-    # ── Figure 2: target LC + systematics ────────────────────────────────
-    fwhm_as = data["fwhm"][_order] * platescale_as
-    sky_adu_s = data["sky"][_order] / data["exptime"][_order]
+        # Query Gaia over a slightly larger area than the FOV to allow for pointing error.
+        logger.info("Querying Gaia and solving WCS...")
+        use_tmass = False
+        if target_filter in ["zYJ", "Y", "J", "H", "Ks"]:
+            use_tmass = True
+            logger.info("Target filter is '%s'; using 2MASS for WCS fit", target_filter)
+        all_radecs = gaia_radecs(
+            center,
+            1.5 * fov,
+            tmass=use_tmass,
+        )
+        # Match the 15 brightest detected stars to the 15 brightest Gaia sources.
+        wcs = compute_wcs(ref_coords_all[0:15], all_radecs[0:15], tolerance=10)
 
-    fig2, axes2 = plt.subplots(
-        5,
-        1,
-        figsize=(10, 12),
-        sharex=True,
-        gridspec_kw={"height_ratios": [3, 1.5, 1.5, 1.5, 1.5], "hspace": 0.06},
-    )
+        # Check if platescale from WCS is consistent with optics keywords
+        wcs_h = wcs.to_header()  # ensure cdelt and pc are populated
+        wcs_platescale = np.abs(
+            wcs_h["CDELT1"] * wcs_h["PC1_1"]
+        )  # degrees/pixel -> arcsec/pixel
+        logger.info("WCS plate scale: %.4f arcsec/pixel", wcs_platescale * 3600)
+        if abs(wcs_platescale - pixel_scale) / (pixel_scale) > 0.1:
+            logger.error(
+                "WCS plate scale %.4f arcsec/pixel differs from optics-derived "
+                "plate scale %.4f arcsec/pixel by more than 10%%;",
+                wcs_platescale * 3600,
+                pixel_scale * 3600,
+            )
+            exit(1)
 
-    # Target light curve
-    axes2[0].scatter(
-        t_plot,
-        target_lc,
-        s=4,
-        c="0.65",
-        alpha=0.5,
-        linewidths=0,
-        rasterized=True,
-    )
-    axes2[0].errorbar(
-        bt_t,
-        by_t,
-        be_t,
-        fmt="o",
-        ms=5,
-        color="#2166ac",
-        elinewidth=1,
-        capsize=2,
-        zorder=3,
-    )
-    axes2[0].axhline(1, lw=0.8, ls="--", color="0.45")
-    axes2[0].set_ylabel("Diff. flux")
-    axes2[0].set_title(
-        f"{target}  ·  {target_filter}  ·  aperture {best_aperture}  ·  {day_date}",
-        fontsize=10,
-    )
+        # Convert reference-frame star pixel positions to sky coordinates via the
+        # WCS, resolve the target's Gaia coordinates, and find which star it is.
+        stars_radec = wcs.pixel_to_world(*ref_coords.T)
 
-    # FWHM
-    fin = np.isfinite(fwhm_as)
-    bt_s, by_s, _ = _bin_lc(t_plot[fin], fwhm_as[fin])
-    axes2[1].scatter(
-        t_plot[fin],
-        fwhm_as[fin],
-        s=3,
-        c="0.7",
-        alpha=0.5,
-        linewidths=0,
-        rasterized=True,
-    )
-    axes2[1].plot(bt_s, by_s, "o-", ms=3, lw=0.9, color="#4393c3")
-    axes2[1].set_ylabel('FWHM (")')
+        mast = Mast()
+        target_radec = mast.resolve_object(query_string)
+        target_index = int(target_radec.match_to_catalog_sky(stars_radec)[0])
+        logger.info("Target matched to star index %d", target_index)
 
-    # Sky background
-    fin = np.isfinite(sky_adu_s)
-    bt_s, by_s, _ = _bin_lc(t_plot[fin], sky_adu_s[fin])
-    axes2[2].scatter(
-        t_plot[fin],
-        sky_adu_s[fin],
-        s=3,
-        c="0.7",
-        alpha=0.5,
-        linewidths=0,
-        rasterized=True,
-    )
-    axes2[2].plot(bt_s, by_s, "o-", ms=3, lw=0.9, color="#762a83")
-    axes2[2].set_ylabel(r"Sky (ADU s$^{-1}$ px$^{-1}$)")
+        # =======================================================================
+        # Main loop: per-frame photometry, parallelised across worker processes
+        # =======================================================================
+        stack = np.zeros_like(ref_data, dtype=float)  # co-added, aligned science stack
+        data = defaultdict(list)  # per-frame measurements, keyed by quantity
+        movie = []  # downsampled uint8 frames (frame order), for the night movie
 
-    # Centroid drift dx and dy on the same panel
-    for y_arr, color, label in [
-        (data["dx"][_order], "#1b7837", "$\Delta x$"),
-        (data["dy"][_order], "#e08214", "$\Delta y$"),
-    ]:
-        fin = np.isfinite(y_arr)
-        bt_s, by_s, _ = _bin_lc(t_plot[fin], y_arr[fin])
-        axes2[3].scatter(
-            t_plot[fin],
-            y_arr[fin],
-            s=3,
-            alpha=0.35,
+        chunks = _chunks(filter_light_frames, N_WORKERS)
+        logger.info(
+            "Processing %d frames across %d workers...",
+            len(filter_light_frames),
+            len(chunks),
+        )
+        # Per-frame progress: workers signal this queue once per frame (success,
+        # skip, or error). A drain thread reads it and updates tqdm independently
+        # of when whole chunks complete, giving smooth and accurate progress.
+        # Manager().Queue() produces a proxy object that is picklable across the
+        # spawn boundary used by macOS — plain multiprocessing.Queue is not.
+        stop_drain = threading.Event()
+
+        with (
+            _MPManager() as _manager,
+            tqdm(total=len(filter_light_frames), unit="frame") as pbar,
+        ):
+            progress_q = _manager.Queue()
+
+            def _drain():
+                while not stop_drain.is_set():
+                    try:
+                        progress_q.get(timeout=0.2)
+                        pbar.update(1)
+                    except Exception:
+                        pass
+
+            drain_thread = threading.Thread(target=_drain, daemon=True)
+            drain_thread.start()
+
+            with ProcessPoolExecutor(
+                max_workers=N_WORKERS,
+                initializer=_init_worker,
+                initargs=(
+                    DARK,
+                    FLAT,
+                    BIAS,
+                    ref_coords,
+                    ref_coords_all,
+                    ref_reference,
+                    stack.shape,
+                    bp_mask,
+                ),
+            ) as pool:
+                futures = [
+                    pool.submit(_process_frames, chunk, progress_q) for chunk in chunks
+                ]
+                for future in as_completed(futures):
+                    results, partial_stack, thumbs = future.result()
+                    stack += partial_stack
+                    movie.extend(thumbs)
+                    for result in results:
+                        for key, value in result.items():
+                            data[key].append(value)
+
+            stop_drain.set()
+            drain_thread.join(timeout=2)
+
+        # Convert the per-frame lists into stacked arrays for saving/analysis.
+        for k, v in data.items():
+            data[k] = np.array(v)
+        movie = np.array(movie)  # (n_frames, h, w) uint8
+
+        # Persist the raw photometry products for later analysis.
+        telescope_name = ref_header.get(KW_TELESCOP, "unknown")
+        safe_target_filter = (
+            target_filter.replace(" ", "-").replace("/", "-").replace("'", "")
+        )
+        output_file = (
+            output_dir
+            / f"photometry_data_{telescope_name}_{safe_target_filter}_{target}_{day_date}.npz"
+        )
+        np.savez(
+            output_file,
+            platescale=pixel_scale * 3600,
+            read_noise=read_noise,
+            dark_current=dark_current,
+            **data,
+        )
+        logger.info("Saved photometry to %s", output_file)
+
+        # =======================================================================
+        # Differential photometry
+        # =======================================================================
+        # Background-subtracted fluxes, shaped (apertures, stars, frames).
+        fluxes = (data["fluxes"] - data["bkg"]).T
+
+        # Differential photometry against an automatically-chosen comparison set.
+        diffs, weights = flux.auto_diff(fluxes, target_index)
+
+        # Pick the aperture that minimises the target's light-curve scatter.
+        best_aperture = optimal_aperture(
+            diffs, target_index, data["time"], weights, bin_minutes=10.0
+        )
+        logger.info("Best aperture index: %d", best_aperture)
+
+        logger.info("Saving night-report bundle for night_report.py...")
+        # Artificial (comparison) light curve per aperture: the weighted mean of the
+        # normalised comparison fluxes used to detrend the target (Broeg 2005). The
+        # comparison weights differ per aperture, so this is shape (apertures, frames).
+        norm_fluxes = fluxes / np.nanmean(fluxes, axis=-1, keepdims=True)
+        wsum = weights.sum(axis=-1, keepdims=True)
+        alc = np.einsum("as,asf->af", weights, norm_fluxes) / np.where(
+            wsum == 0, np.nan, wsum
+        )
+
+        # =======================================================================
+        # Save the night-report bundle (data + images + movie) for night_report.py
+        # =======================================================================
+        report_file = (
+            output_dir
+            / f"night_report_{telescope_name}_{safe_target_filter}_{target}_{day_date}.npz"
+        )
+        np.savez_compressed(
+            report_file,
+            stack=stack,
+            master_bias=BIAS,
+            master_dark=DARK,
+            master_flat=FLAT,
+            ref_coords=ref_coords,
+            target_index=target_index,
+            diffs=diffs,
+            weights=weights,
+            alc=alc,
+            best_aperture=best_aperture,
+            movie=movie,
+            target=target,
+            date=str(day_date),
+            band=target_filter,
+            telescope=telescope_name,
+            platescale=pixel_scale * 3600,  # arcsec/pixel
+            read_noise=read_noise,
+            dark_current=dark_current,
+            **data,
+        )
+        logger.info(
+            'Saved night-report bundle to %s (visualise with `uv run night_report.py "%s"`)',
+            report_file,
+            report_file,
+        )
+
+        # =======================================================================
+        # Diagnostic figures
+        # =======================================================================
+        fig_prefix = f"{telescope_name}_{safe_target_filter}_{target}_{day_date}"
+        platescale_as = pixel_scale * 3600  # arcsec / pixel
+
+        t_jd = data["time"]
+        jd0 = int(np.floor(t_jd.min()))
+        # Sort into chronological order once; workers return frames in completion
+        # order (as_completed), not observation order.
+        _order = np.argsort(t_jd)
+        t_plot = (t_jd - jd0)[_order]
+
+        target_lc = diffs[best_aperture, target_index][_order]
+        bt_t, by_t, be_t = _bin_lc(t_plot, target_lc)
+
+        # Comparison stars with non-zero weight at the best aperture.
+        comp_idx = [
+            i
+            for i in range(diffs.shape[1])
+            if i != target_index and weights[best_aperture, i] > 0
+        ]
+        w_total = weights[best_aperture, comp_idx].sum() or 1.0
+
+        # ── Figure 1: target LC + comparison star subplots ───────────────────
+        n_comps = len(comp_idx)
+        n_cols = min(4, max(1, n_comps))
+        n_rows_comp = math.ceil(n_comps / n_cols) if n_comps else 0
+
+        fig1 = plt.figure(figsize=(max(8, 3.5 * n_cols), 3.5 + 2.2 * n_rows_comp))
+        gs1 = gridspec.GridSpec(
+            1 + n_rows_comp,
+            n_cols,
+            figure=fig1,
+            height_ratios=[3] + [1.8] * n_rows_comp,
+            hspace=0.45,
+            wspace=0.35,
+        )
+
+        ax_top = fig1.add_subplot(gs1[0, :])
+        ax_top.scatter(
+            t_plot,
+            target_lc,
+            s=4,
+            c="0.65",
+            alpha=0.5,
             linewidths=0,
-            color=color,
             rasterized=True,
         )
-        axes2[3].plot(bt_s, by_s, "o-", ms=3, lw=0.9, color=color, label=label)
-    axes2[3].axhline(0, lw=0.7, ls="--", color="0.5")
-    axes2[3].set_ylabel("Centroid drift (px)")
-    axes2[3].legend(fontsize=8, frameon=False, ncol=2)
+        ax_top.errorbar(
+            bt_t,
+            by_t,
+            be_t,
+            fmt="o",
+            ms=5,
+            color="#2166ac",
+            elinewidth=1,
+            capsize=2,
+            label="10-min bins",
+            zorder=3,
+        )
+        ax_top.axhline(1, lw=0.8, ls="--", color="0.45")
+        ax_top.set_ylabel("Diff. flux")
+        ax_top.set_title(
+            f"{target}  ·  {target_filter}  ·  aperture {best_aperture}  ·  {day_date}",
+            fontsize=10,
+        )
+        ax_top.legend(fontsize=8, frameon=False)
+        if n_rows_comp:
+            ax_top.tick_params(labelbottom=False)
+        else:
+            ax_top.set_xlabel(f"JD − {jd0}")
 
-    # Airmass
-    airmass = data["airmass"][_order]
-    fin = np.isfinite(airmass)
-    axes2[4].plot(t_plot[fin], airmass[fin], "o-", ms=3, lw=0.9, color="#636363")
-    axes2[4].set_ylabel("Airmass")
-    axes2[4].set_xlabel(f"JD − {jd0}")
+        for k, ci in enumerate(comp_idx):
+            row = 1 + k // n_cols
+            col = k % n_cols
+            ax = fig1.add_subplot(gs1[row, col])
+            lc_c = diffs[best_aperture, ci][_order]
+            bt_c, by_c, be_c = _bin_lc(t_plot, lc_c)
+            ax.scatter(
+                t_plot, lc_c, s=2, c="0.7", alpha=0.4, linewidths=0, rasterized=True
+            )
+            ax.errorbar(
+                bt_c,
+                by_c,
+                be_c,
+                fmt="o",
+                ms=3,
+                color="#d6604d",
+                elinewidth=0.6,
+                capsize=1.5,
+                zorder=3,
+            )
+            w_frac = weights[best_aperture, ci] / w_total
+            ax.set_title(f"comp #{ci}  w = {w_frac:.3f}", fontsize=7)
+            ax.set_ylim(0.96, 1.04)
+            ax.tick_params(labelsize=7)
+            if col == 0:
+                ax.set_ylabel("Diff. flux", fontsize=7)
+            if row == n_rows_comp:
+                ax.set_xlabel(f"JD − {jd0}", fontsize=7)
 
-    for ax in axes2:
-        ax.tick_params(labelsize=9)
+        lc_path = output_dir / f"lc_{fig_prefix}.pdf"
+        fig1.savefig(lc_path, bbox_inches="tight")
+        logger.info("Saved light-curve figure to %s", lc_path)
+        plt.close(fig1)
 
-    syst_path = output_dir / f"systematics_{fig_prefix}.pdf"
-    fig2.savefig(syst_path, bbox_inches="tight")
-    logger.info("Saved systematics figure to %s", syst_path)
-    plt.close(fig2)
+        # ── Figure 2: target LC + systematics ────────────────────────────────
+        fwhm_as = data["fwhm"][_order] * platescale_as
+        sky_adu_s = data["sky"][_order] / data["exptime"][_order]
 
-    # =======================================================================
-    # Optional: build the interactive HTML night report from the saved bundle
-    # =======================================================================
-    if args.report:
-        logger.info("Building interactive night report...")
-        # Imported lazily so the multiprocessing workers don't pay for
-        # night_report's (imageio/PIL) imports on every spawn.
-        from night_report import build_report
+        fig2, axes2 = plt.subplots(
+            5,
+            1,
+            figsize=(10, 12),
+            sharex=True,
+            gridspec_kw={"height_ratios": [3, 1.5, 1.5, 1.5, 1.5], "hspace": 0.06},
+        )
 
-        build_report(report_file)
+        # Target light curve
+        axes2[0].scatter(
+            t_plot,
+            target_lc,
+            s=4,
+            c="0.65",
+            alpha=0.5,
+            linewidths=0,
+            rasterized=True,
+        )
+        axes2[0].errorbar(
+            bt_t,
+            by_t,
+            be_t,
+            fmt="o",
+            ms=5,
+            color="#2166ac",
+            elinewidth=1,
+            capsize=2,
+            zorder=3,
+        )
+        axes2[0].axhline(1, lw=0.8, ls="--", color="0.45")
+        axes2[0].set_ylabel("Diff. flux")
+        axes2[0].set_title(
+            f"{target}  ·  {target_filter}  ·  aperture {best_aperture}  ·  {day_date}",
+            fontsize=10,
+        )
+
+        # FWHM
+        fin = np.isfinite(fwhm_as)
+        bt_s, by_s, _ = _bin_lc(t_plot[fin], fwhm_as[fin])
+        axes2[1].scatter(
+            t_plot[fin],
+            fwhm_as[fin],
+            s=3,
+            c="0.7",
+            alpha=0.5,
+            linewidths=0,
+            rasterized=True,
+        )
+        axes2[1].plot(bt_s, by_s, "o-", ms=3, lw=0.9, color="#4393c3")
+        axes2[1].set_ylabel('FWHM (")')
+
+        # Sky background
+        fin = np.isfinite(sky_adu_s)
+        bt_s, by_s, _ = _bin_lc(t_plot[fin], sky_adu_s[fin])
+        axes2[2].scatter(
+            t_plot[fin],
+            sky_adu_s[fin],
+            s=3,
+            c="0.7",
+            alpha=0.5,
+            linewidths=0,
+            rasterized=True,
+        )
+        axes2[2].plot(bt_s, by_s, "o-", ms=3, lw=0.9, color="#762a83")
+        axes2[2].set_ylabel(r"Sky (ADU s$^{-1}$ px$^{-1}$)")
+
+        # Centroid drift dx and dy on the same panel
+        for y_arr, color, label in [
+            (data["dx"][_order], "#1b7837", "$\Delta x$"),
+            (data["dy"][_order], "#e08214", "$\Delta y$"),
+        ]:
+            fin = np.isfinite(y_arr)
+            bt_s, by_s, _ = _bin_lc(t_plot[fin], y_arr[fin])
+            axes2[3].scatter(
+                t_plot[fin],
+                y_arr[fin],
+                s=3,
+                alpha=0.35,
+                linewidths=0,
+                color=color,
+                rasterized=True,
+            )
+            axes2[3].plot(bt_s, by_s, "o-", ms=3, lw=0.9, color=color, label=label)
+        axes2[3].axhline(0, lw=0.7, ls="--", color="0.5")
+        axes2[3].set_ylabel("Centroid drift (px)")
+        axes2[3].legend(fontsize=8, frameon=False, ncol=2)
+
+        # Airmass
+        airmass = data["airmass"][_order]
+        fin = np.isfinite(airmass)
+        axes2[4].plot(t_plot[fin], airmass[fin], "o-", ms=3, lw=0.9, color="#636363")
+        axes2[4].set_ylabel("Airmass")
+        axes2[4].set_xlabel(f"JD − {jd0}")
+
+        for ax in axes2:
+            ax.tick_params(labelsize=9)
+
+        syst_path = output_dir / f"systematics_{fig_prefix}.pdf"
+        fig2.savefig(syst_path, bbox_inches="tight")
+        logger.info("Saved systematics figure to %s", syst_path)
+        plt.close(fig2)
+
+        # =======================================================================
+        # Optional: build the interactive HTML night report from the saved bundle
+        # =======================================================================
+        if args.report:
+            logger.info("Building interactive night report...")
+            # Imported lazily so the multiprocessing workers don't pay for
+            # night_report's (imageio/PIL) imports on every spawn.
+            from night_report import build_report
+
+            build_report(report_file)
 
 
 if __name__ == "__main__":
