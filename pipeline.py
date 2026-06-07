@@ -33,7 +33,6 @@ import matplotlib
 import numpy as np
 from astropy.coordinates import SkyCoord
 from astropy.io import fits
-from astropy.stats import sigma_clipped_stats
 from astropy.time import Time
 from astroquery.mast import Mast
 from dateutil import parser
@@ -48,7 +47,6 @@ from eloy import (
     utils,
 )
 from eloy.ballet import Ballet
-from photutils.detection import DAOStarFinder
 from skimage.transform import AffineTransform
 
 matplotlib.use("Agg")
@@ -169,78 +167,6 @@ def find_files(glob_pattern: str) -> list[str]:
     files_meta = dict(sorted(files_meta.items(), key=lambda item: item[1]["datetime"]))
 
     return observations, files_meta
-
-
-def find_stars(
-    data: np.ndarray,
-    threshold: float = 5.0,
-    peak_threshold: float | None = None,
-    fwhm: float = 5.0,
-    saturation_limit: float | None = None,
-) -> np.ndarray:
-    """
-    Find stars using DAOStarFinder algorithm.
-
-    Uses the photutils DAOStarFinder algorithm to detect point sources in
-    astronomical images. The function performs background subtraction and
-    returns star coordinates sorted by brightness.
-
-    Parameters:
-        data (np.ndarray): The 2D image data array.
-        threshold (float, optional): Detection threshold in units of background
-            standard deviation. Higher values detect fewer, brighter stars.
-            Defaults to 5.0.
-        fwhm (float, optional): Expected Full Width at Half Maximum of stars
-            in pixels. Should match the typical seeing conditions. Defaults to 5.0.
-        peak_threshold (float, optional): Threshold for the peak value of detected stars.
-            Stars with peak values below this limit will be excluded. Defaults to None.
-        saturation_limit (float, optional): Saturation limit for star detection.
-            Stars with flux above this limit will be excluded. Defaults to None.
-
-    Returns:
-        np.ndarray: Array of detected star coordinates sorted by brightness.
-            Shape is (N, 2) where N is the number of stars, and each row is (x, y).
-            Returns an empty array if no stars are found.
-    """
-    # Calculate background statistics
-    mean, median, std = sigma_clipped_stats(data, sigma=3.0)
-
-    # Use DAOStarFinder for star detection
-    dao_find = DAOStarFinder(
-        fwhm=fwhm,
-        threshold=threshold * std,
-        exclude_border=True,
-        min_separation=2 * fwhm,
-    )
-    dao_sources = dao_find(data)
-
-    if dao_sources is None or len(dao_sources) == 0:
-        return np.array([]).reshape(0, 2)
-
-    # Sort sources by flux (brightness) in descending order
-    sorted_indices = np.argsort(dao_sources["flux"])[::-1]
-    dao_sources = dao_sources[sorted_indices]
-
-    # Filter sources based on peak value
-    if peak_threshold is None:
-        peak_threshold = threshold
-
-    dao_sources = dao_sources[dao_sources["peak"] > mean + peak_threshold * std]
-
-    # Filter sources based on saturation limit
-    if saturation_limit is not None:
-        dao_sources = dao_sources[dao_sources["peak"] < saturation_limit]
-
-    # Convert to (x, y) coordinates
-    coordinates = np.column_stack([dao_sources["xcentroid"], dao_sources["ycentroid"]])
-
-    # get to similar output format as the old code, which is a list of regionprops objects with .centroid attribute
-    regions = []
-    for x, y in coordinates:
-        region = type("Region", (), {"centroid": (y, x)})()
-        regions.append(region)
-
-    return np.array(coordinates), regions
 
 
 def bad_pixel_map(dark_files, master_bias=None, std_factor_upper=3, std_factor_lower=3):
@@ -738,128 +664,6 @@ def _bin_residual_score(lc: np.ndarray, t: np.ndarray, bin_minutes: float) -> fl
     return float(np.std(np.concatenate(residuals)))
 
 
-def _fallback_auto_diff(
-    fluxes: np.ndarray, target_index: int | None
-) -> tuple[np.ndarray, np.ndarray]:
-    """Compute differential photometry without relying on eloy's 2D helper.
-
-    The installed ``eloy.flux.auto_diff`` currently fails on a single aperture's
-    ``(stars, frames)`` slice because its internal weight helper assumes an
-    extra leading aperture axis. This fallback keeps the same I/O contract and
-    uses inverse white-noise weighting when available, else uniform comparison
-    weights so perfectly constant synthetic light curves still reduce cleanly.
-    """
-    flux_array = np.asarray(fluxes, dtype=float)
-    squeeze_result = flux_array.ndim == 2
-    if squeeze_result:
-        flux_array = flux_array[None, ...]
-    if flux_array.ndim != 3:
-        raise ValueError(
-            "Differential photometry expects fluxes with shape "
-            "(apertures, stars, frames) or (stars, frames)"
-        )
-
-    n_apertures, n_stars, _ = flux_array.shape
-    diffs = np.full_like(flux_array, np.nan, dtype=float)
-    weights = np.zeros((n_apertures, n_stars), dtype=float)
-
-    for ap in range(n_apertures):
-        aperture_fluxes = flux_array[ap]
-        mean_flux = np.nanmean(aperture_fluxes, axis=-1, keepdims=True)
-        norm_flux = aperture_fluxes / np.where(mean_flux == 0, np.nan, mean_flux)
-
-        comp_mask = np.all(np.isfinite(norm_flux), axis=-1)
-        if target_index is not None:
-            comp_mask[target_index] = False
-
-        comp_indices = np.flatnonzero(comp_mask)
-        if len(comp_indices) == 0:
-            logger.warning(
-                "Aperture %d: no valid comparison stars for differential photometry; "
-                "using normalized fluxes.",
-                ap,
-            )
-            diffs[ap] = norm_flux
-            continue
-
-        scatter = np.nanstd(norm_flux[comp_indices], axis=-1)
-        good_scatter = np.isfinite(scatter) & (scatter > 0)
-        if np.any(good_scatter):
-            inv_scatter = 1.0 / scatter[good_scatter]
-            ap_weights = inv_scatter / np.sum(inv_scatter)
-            weights[ap, comp_indices[good_scatter]] = ap_weights
-        else:
-            weights[ap, comp_indices] = 1.0 / len(comp_indices)
-
-        time_weights = weights[ap, :, None] * np.isfinite(norm_flux)
-        artificial = np.nansum(norm_flux * weights[ap, :, None], axis=0) / np.where(
-            np.sum(time_weights, axis=0) == 0,
-            np.nan,
-            np.sum(time_weights, axis=0),
-        )
-        diffs[ap] = norm_flux / artificial[None, :]
-
-    if squeeze_result:
-        return diffs[0], weights[0]
-    return diffs, weights
-
-
-def safe_auto_diff(
-    fluxes: np.ndarray, target_index: int | None
-) -> tuple[np.ndarray, np.ndarray]:
-    """Run ``eloy.flux.auto_diff`` with shape/quality guards and a fallback."""
-    flux_array = np.asarray(fluxes)
-
-    # The installed eloy release iterates over aperture slices and then calls a
-    # helper that mishandles 2D ``(stars, frames)`` inputs. Skip that path for
-    # the aperture cube this pipeline produces.
-    if flux_array.ndim == 3:
-        logger.warning(
-            "eloy.flux.auto_diff does not support 3D inputs; using local fallback."
-        )
-        return _fallback_auto_diff(flux_array, target_index)
-
-    try:
-        diffs, weights = flux.auto_diff(fluxes, target_index)
-    except Exception as exc:
-        logger.warning(
-            "eloy.flux.auto_diff failed (%s: %s); using local fallback.",
-            type(exc).__name__,
-            exc,
-        )
-        return _fallback_auto_diff(fluxes, target_index)
-
-    diffs = np.asarray(diffs, dtype=float)
-    weights = np.asarray(weights, dtype=float)
-
-    expected_weights_shape = flux_array.shape[:-1]
-    if weights.shape != expected_weights_shape:
-        logger.warning(
-            "eloy.flux.auto_diff returned weights with shape %s; expected %s. "
-            "Using local fallback.",
-            weights.shape,
-            expected_weights_shape,
-        )
-        return _fallback_auto_diff(fluxes, target_index)
-
-    if target_index is not None:
-        comp_weights = weights.copy()
-        comp_weights[..., target_index] = 0
-    else:
-        comp_weights = weights
-
-    bad_weights = np.any(~np.isfinite(weights))
-    missing_comps = np.any(np.nansum(np.clip(comp_weights, 0, None), axis=-1) <= 0)
-    if bad_weights or missing_comps or not np.all(np.isfinite(diffs)):
-        logger.warning(
-            "eloy.flux.auto_diff returned unusable weights/differential fluxes; "
-            "using local fallback.",
-        )
-        return _fallback_auto_diff(fluxes, target_index)
-
-    return diffs, weights
-
-
 def optimal_aperture(
     diffs: np.ndarray,
     target_index: int,
@@ -1244,7 +1048,7 @@ def main():
     fluxes = (data["fluxes"] - data["bkg"]).T
 
     # Differential photometry against an automatically-chosen comparison set.
-    diffs, weights = safe_auto_diff(fluxes, target_index)
+    diffs, weights = flux.auto_diff(fluxes, target_index)
 
     # Pick the aperture that minimises the target's light-curve scatter.
     best_aperture = optimal_aperture(
