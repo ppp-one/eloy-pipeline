@@ -1,4 +1,4 @@
-# SPECULOOS-South Photometry Pipeline
+# Photometry Pipeline
 
 Reduce a night of FITS observations into a differential light curve, then turn
 that into a self-contained interactive HTML report. Two scripts do the work:
@@ -25,6 +25,9 @@ automatically by exposure time and filter, so you don't sort them yourself. Add
 `--report` to get the interactive report next to the data, or drop it to run the
 reduction alone. `ffmpeg` needs to be on your `PATH` for the report's movie.
 
+If the target was observed in more than one filter the pipeline runs once per
+filter automatically, producing a separate set of output files for each.
+
 ## pipeline.py
 
 What it does, per run:
@@ -50,9 +53,12 @@ and a systematics panel (FWHM, sky, centroid drift, airmass).
 |---|---|---|
 | `--image_path` | required | Directory of FITS files for the night. |
 | `--target` | required | `OBJECT` header value of the science target. |
-| `--query-string` | `--target` | Name resolved via MAST |
+| `--query-string` | `--target` | Name resolved via MAST. |
 | `--fix-bad-pixels` | off | Mask hot/dead pixels from the darks and interpolate over them before photometry. |
 | `--output-dir` | `.` | Where to write outputs; created if missing. |
+| `--flat-dir` | — | Directory of flat frames that **override** those found in `--image_path`. Only files whose `IMAGETYP` header marks them as flats and whose `FILTER` matches the target filter are used. |
+| `--dark-dir` | — | Directory of dark frames that **override** those found in `--image_path`. Exposure-time matching is still applied. |
+| `--bias-dir` | — | Directory of bias frames that **override** those found in `--image_path`. |
 | `--report` | off | Build the HTML report (and its assets folder) after reducing. |
 
 ### Output
