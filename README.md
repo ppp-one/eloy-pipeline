@@ -4,6 +4,8 @@ Reduce a night of FITS observations into a differential light curve, then turn
 that into a self-contained interactive HTML report. Two scripts do the work:
 `pipeline.py` (the reduction) and `night_report.py` (the report).
 
+![report screenshot](screenshot.jpg)
+
 ## Quick start
 
 ```bash
