@@ -34,6 +34,7 @@ import numpy as np
 from astropy.coordinates import SkyCoord
 from astropy.io import fits
 from astropy.time import Time
+from astropy.visualization import ZScaleInterval
 from astroquery.mast import Mast
 from dateutil import parser
 from eloy import (
@@ -426,19 +427,26 @@ def extract_plate_scale(header) -> float:
         return DEFAULT_PLATESCALE / 3600  # arcsec/pixel -> deg/pixel
 
 
-def _movie_frame(image, max_px=MOVIE_MAX_PX):
-    """Downsample and contrast-stretch a frame into a uint8 night-movie thumbnail.
+_ZSCALE = ZScaleInterval()  # DS9-style display limits, shared with night_report.py
 
-    Strides the image down so its longest side is at most ``max_px``, clips to a
-    robust percentile range, and applies an asinh stretch so faint stars show
-    without the bright ones saturating.
+
+def _movie_frame(image, max_px=MOVIE_MAX_PX):
+    """Downsample and ZScale-stretch a frame into a uint8 night-movie thumbnail.
+
+    Strides the image down so its longest side is at most ``max_px``, then maps
+    the ZScale (DS9-style) low/high limits to 0..255 so faint stars stay visible
+    without the bright ones washing out. Matches night_report.py's stack stretch.
     """
     step = max(1, int(np.ceil(max(image.shape) / max_px)))
     small = image[::step, ::step]
-    lo, hi = np.percentile(small, [25, 99.5])
+    finite = small[np.isfinite(small)]
+    if finite.size == 0:
+        return np.zeros(small.shape, dtype=np.uint8)
+    lo, hi = _ZSCALE.get_limits(finite)
     norm = np.clip((small - lo) / (hi - lo + 1e-9), 0, 1)
-    stretched = np.arcsinh(norm * 10) / np.arcsinh(10)
-    return (stretched * 255).astype(np.uint8)
+    # NaN pixels (unfillable bad pixels) survive the clip; map them to black so
+    # the uint8 cast is well-defined.
+    return (np.nan_to_num(norm, nan=0.0) * 255).astype(np.uint8)
 
 
 # ===========================================================================
@@ -798,6 +806,12 @@ def main():
         default=".",
         metavar="DIR",
         help="Directory to write output files to (created if needed; default: current directory).",
+    )
+    ap.add_argument(
+        "--report",
+        action="store_true",
+        default=False,
+        help="After processing, build the interactive HTML night report from the saved bundle.",
     )
     args = ap.parse_args()
     image_path = args.image_path
@@ -1335,6 +1349,17 @@ def main():
     fig2.savefig(syst_path, bbox_inches="tight")
     logger.info("Saved systematics figure to %s", syst_path)
     plt.close(fig2)
+
+    # =======================================================================
+    # Optional: build the interactive HTML night report from the saved bundle
+    # =======================================================================
+    if args.report:
+        logger.info("Building interactive night report...")
+        # Imported lazily so the multiprocessing workers don't pay for
+        # night_report's (imageio/PIL) imports on every spawn.
+        from night_report import build_report
+
+        build_report(report_file)
 
 
 if __name__ == "__main__":

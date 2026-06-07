@@ -53,7 +53,8 @@ uv run pipeline.py \
   --target "Sp0025+5422" \
   [--query-string "SP0025+5422"] \  # name for MAST coordinate resolution if different from --target
   [--fix-bad-pixels] \              # interpolate over hot/dead pixels before photometry
-  [--output-dir results/]          # where to write outputs (default: current directory)
+  [--output-dir results/] \        # where to write outputs (default: current directory)
+  [--report]                       # also build the interactive HTML report at the end
 ```
 
 `--image_path` must contain all FITS frames for the night (lights, darks,
@@ -67,6 +68,7 @@ and filter.
 | `--query-string` | same as `--target` | Name resolved via MAST for the target's sky coordinates. Use when the `OBJECT` value isn't resolvable. |
 | `--fix-bad-pixels` | off | Build a hot/dead-pixel mask from the dark frames and interpolate flagged pixels (plus negatives and above-full-well pixels) from their valid neighbours before photometry. |
 | `--output-dir` | `.` (current dir) | Directory for all outputs (npz bundles and PDFs); created if it doesn't exist. |
+| `--report` | off | After processing, build the interactive HTML night report (and its mp4) from the saved bundle, in `--output-dir`. Equivalent to running `night_report.py` on the bundle afterwards. |
 
 ### Output
 
@@ -96,8 +98,9 @@ Requires Python 3.11.8 (pinned in `pyproject.toml`). `ffmpeg` must be on
 Reads the `night_report_...npz` bundle and writes a self-contained HTML file
 (Plotly + D3, loaded from CDN) with:
 
-- **Stack viewer** — co-added image with aperture circles for every detected
-  star; tabs to switch to the master flat, dark, or bias frame; zoom and pan.
+- **Stack viewer** — co-added image (ZScale stretch) with aperture circles for
+  every detected star; tabs to switch to the master flat, dark, or bias frame;
+  zoom and pan.
 - **Night movie** — per-frame thumbnails encoded to an embedded MP4; the
   playhead scrubs automatically as you move the cursor across the light curve.
 - **Light curve** — raw and binned differential flux; aperture slider and
@@ -106,8 +109,6 @@ Reads the `night_report_...npz` bundle and writes a self-contained HTML file
 - **Systematics panel** — FWHM, sky background, x/y centroid drift, airmass,
   ALC, or any individual star's differential flux. Hover any star circle on the
   stack image to display its light curve.
-- **Diagnostic chips** — flags for high airmass, elevated sky background, large
-  FWHM, or target saturation.
 - **Light / dark mode toggle** in the header; preference persists in
   `localStorage` and respects the OS `prefers-color-scheme` setting on first
   load.

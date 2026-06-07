@@ -30,6 +30,7 @@ from pathlib import Path
 
 import imageio.v2 as imageio
 import numpy as np
+from astropy.visualization import ZScaleInterval
 from PIL import Image as PILImage
 
 logging.basicConfig(
@@ -39,9 +40,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("night_report")
 
-SATURATED = 65535 * 0.9  # same saturation threshold as the pipeline
 PLOTLY_CDN = "https://cdn.plot.ly/plotly-2.35.2.min.js"
 DEFAULT_PLATESCALE = 0.348  # arcsec/pixel, used when not stored in the bundle
+_ZSCALE = ZScaleInterval()  # DS9-style display limits, shared with pipeline.py
 
 # Comparison-star marker colour and target colour (mirroring the portal palette).
 COLOR_TARGET = "#3F92FF"
@@ -69,11 +70,14 @@ def jsonify(obj):
 
 
 def stretch(image):
-    """asinh contrast stretch to 0..1 for display, robust to bright stars."""
+    """ZScale (DS9-style) contrast stretch to 0..1 for display."""
     image = np.asarray(image, float)
-    lo, hi = np.nanpercentile(image, [25, 99.5])
+    finite = image[np.isfinite(image)]
+    if finite.size == 0:
+        return np.zeros_like(image)
+    lo, hi = _ZSCALE.get_limits(finite)
     norm = np.clip((image - lo) / (hi - lo + 1e-9), 0, 1)
-    return np.arcsinh(norm * 10) / np.arcsinh(10)
+    return np.nan_to_num(norm, nan=0.0)  # non-finite pixels -> black
 
 
 def png_data_uri(image, max_px=2048, step=None):
@@ -406,39 +410,6 @@ def lightcurve_figure(d, best, target_index, platescale=DEFAULT_PLATESCALE):
     )
 
 
-def diagnostics(d, n_stars, target_index):
-    """Compute the diagnostic flag chips (text, severity)."""
-    chips = []
-
-    def add(text, level):
-        chips.append({"text": text, "level": level})
-
-    airmass = np.asarray(d["airmass"], float)
-    sky = np.asarray(d["sky"], float)
-    fwhm = np.asarray(d["fwhm"], float)
-    max_air = float(np.nanmax(airmass))
-    max_sky = float(np.nanmax(sky))
-    max_fwhm = float(np.nanmax(fwhm))
-
-    if max_air >= 2.5:
-        add(f"airmass reaches {max_air:.1f} (>2.5)", "alert")
-    if 2000 <= max_sky < 4000:
-        add(f"sky a bit high ({max_sky:.0f} > 2000)", "warning")
-    if max_sky >= 4000:
-        add(f"sky can affect observation ({max_sky:.0f} > 4000)", "alert")
-    if max_fwhm >= 7.5:
-        add(f"fwhm reaches {max_fwhm:.1f} px (>7.5)", "alert")
-
-    peak = np.asarray(d.get("peak"))
-    if peak.ndim == 2 and target_index < peak.shape[1]:
-        if np.nanmax(peak[:, target_index]) >= SATURATED:
-            add("target is saturated", "alert")
-
-    if not chips:
-        add("observation looks clean", "green")
-    return chips
-
-
 def compute_alc(d, diffs, weights):
     """Per-aperture artificial light curve (weighted mean of normalised comp fluxes).
 
@@ -502,24 +473,6 @@ def app_payload(
 # ---------------------------------------------------------------------------
 # HTML assembly
 # ---------------------------------------------------------------------------
-
-# SVG icons (inline, stroke-based, matching feather icon style from the portal)
-_ICON_OK = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>'
-_ICON_WARN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>'
-_ICON_ALERT = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>'
-
-_CHIP_ICON = {
-    "alert": _ICON_ALERT,
-    "warning": _ICON_WARN,
-    "green": _ICON_OK,
-    "cloud": _ICON_WARN,
-}
-_CHIP_COLOR = {
-    "alert": "#E0524F",
-    "warning": "#E0A24F",
-    "green": "#139F76",
-    "cloud": "#808891",
-}
 
 
 def render_html(meta, img_fig, lc_fig, app, movie_b64):
@@ -605,10 +558,6 @@ def render_html(meta, img_fig, lc_fig, app, movie_b64):
   --tab-idle:      #808891;
   --tab-active:    #23292f;
   --novideo-fg:    #808891;
-  --diag-alert-bg: rgba(224,82,79,.1);    --diag-alert-fg: #c0342f;
-  --diag-warn-bg:  rgba(224,162,79,.1);   --diag-warn-fg:  #b07020;
-  --diag-green-bg: rgba(19,159,118,.1);   --diag-green-fg: #0e7a5a;
-  --diag-cloud-bg: rgba(128,136,145,.1);  --diag-cloud-fg: #555e66;
   --input-border:  #dde1e5;
   --input-bg:      transparent;
   --input-fg:      #23292f;
@@ -630,10 +579,6 @@ def render_html(meta, img_fig, lc_fig, app, movie_b64):
   --tab-idle:      #636366;
   --tab-active:    #f5f5f7;
   --novideo-fg:    #636366;
-  --diag-alert-bg: rgba(224,82,79,.15);   --diag-alert-fg: #e57373;
-  --diag-warn-bg:  rgba(224,162,79,.15);  --diag-warn-fg:  #ffb74d;
-  --diag-green-bg: rgba(19,159,118,.15);  --diag-green-fg: #4db6ac;
-  --diag-cloud-bg: rgba(128,136,145,.15); --diag-cloud-fg: #90a4ae;
   --input-border:  #38383a;
   --input-bg:      #1c1c1e;
   --input-fg:      #f5f5f7;
@@ -784,24 +729,6 @@ body {{
 }}
 .tab-btn:hover {{ color: var(--tab-active); }}
 .tab-btn.active {{ color: var(--tab-active); border-bottom-color: #bababa; }}
-
-/* ── Diagnostics ───────────────────────────────────────────────── */
-.diagnostics {{ display: flex; flex-wrap: wrap; gap: 6px; }}
-.diagnostic {{
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  font-size: 12px;
-  padding: 4px 10px 4px 7px;
-  border-radius: 3px;
-  font-weight: 500;
-}}
-.diagnostic .icon {{ flex-shrink: 0; width: 14px; height: 14px; }}
-.diagnostic .icon svg {{ width: 14px; height: 14px; display: block; }}
-.diagnostic.alert  {{ background: var(--diag-alert-bg); color: var(--diag-alert-fg); }}
-.diagnostic.warning{{ background: var(--diag-warn-bg);  color: var(--diag-warn-fg); }}
-.diagnostic.green  {{ background: var(--diag-green-bg); color: var(--diag-green-fg); }}
-.diagnostic.cloud  {{ background: var(--diag-cloud-bg); color: var(--diag-cloud-fg); }}
 
 /* ── Controls row ──────────────────────────────────────────────── */
 .controls-row {{
