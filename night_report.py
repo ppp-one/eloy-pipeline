@@ -1195,23 +1195,39 @@ input[type=number]:focus {{ border-color: #bababa; box-shadow: 0 0 0 2px rgba(18
       e.classList.toggle('active', e.dataset.k === String(k)));
   }}
 
-  // Scrub the night movie continuously as the cursor moves across the LC panel.
-  // x values are JD-jd0 (plain floats); convert back to absolute JD for the scrub.
+  // Hover crosshair + movie scrub: a thin vertical line follows the cursor
+  // across both LC subplots (target and systematics share the x-axis). x values
+  // are JD-jd0 (plain floats); converted back to absolute JD to scrub the movie
+  // when one is embedded.
   const vid = document.getElementById('vid');
-  document.getElementById('lc').addEventListener('mousemove', function(evt) {{
-    if (!vid || !vid.duration) return;
-    const fl = document.getElementById('lc')._fullLayout;
+  const lcDiv = document.getElementById('lc');
+  lcDiv.style.position = 'relative';
+  const _spike = document.createElement('div');
+  _spike.style.cssText =
+    'position:absolute;top:0;width:1px;pointer-events:none;opacity:0;'
+    + 'background:var(--text-muted);z-index:5;transition:opacity .08s;';
+  lcDiv.appendChild(_spike);
+
+  lcDiv.addEventListener('mousemove', function(evt) {{
+    const fl = lcDiv._fullLayout;
     if (!fl || !fl.xaxis2) return;
-    const xax = fl.xaxis2;
-    const bb = document.getElementById('lc').getBoundingClientRect();
+    const xax = fl.xaxis2, yTop = fl.yaxis, yBot = fl.yaxis2;
+    const bb = lcDiv.getBoundingClientRect();
     const px = evt.clientX - bb.left - xax._offset;
-    if (!xax._length) return;
-    const frac = Math.max(0, Math.min(1, px / xax._length));
-    const x_val = xax.range[0] + frac * (xax.range[1] - xax.range[0]);  // JD - jd0
-    const t_jd = x_val + D.jd0;  // absolute JD
-    const f = (t_jd - D.t0) / (D.t1 - D.t0);
-    vid.currentTime = Math.max(0, Math.min(1, f)) * vid.duration;
+    if (!xax._length || px < 0 || px > xax._length) {{ _spike.style.opacity = 0; return; }}
+    // Span the crosshair from the top of the upper subplot to the bottom of the lower one.
+    _spike.style.left   = (xax._offset + px) + 'px';
+    _spike.style.top    = yTop._offset + 'px';
+    _spike.style.height = (yBot._offset + yBot._length - yTop._offset) + 'px';
+    _spike.style.opacity = 1;
+    if (vid && vid.duration) {{
+      const frac = Math.max(0, Math.min(1, px / xax._length));
+      const x_val = xax.range[0] + frac * (xax.range[1] - xax.range[0]);  // JD - jd0
+      const f = (x_val + D.jd0 - D.t0) / (D.t1 - D.t0);
+      vid.currentTime = Math.max(0, Math.min(1, f)) * vid.duration;
+    }}
   }});
+  lcDiv.addEventListener('mouseleave', function() {{ _spike.style.opacity = 0; }});
 
   // Initial render of the aperture-dependent overlays.
   _setApLabel(D.best); _redraw(); _renderOverlay(); renderCompList();
