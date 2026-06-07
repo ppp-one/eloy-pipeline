@@ -43,7 +43,7 @@ _ZSCALE = ZScaleInterval()  # DS9-style display limits, shared with pipeline.py
 
 # Comparison-star marker colour and target colour (mirroring the portal palette).
 COLOR_TARGET = "#3F92FF"
-COLOR_COMP = "#9340FF"
+COLOR_COMP = "#C39EFD"
 COLOR_FAINT = "rgba(200,200,200,0.45)"
 
 
@@ -187,7 +187,7 @@ def circle_shapes(coords, indices, radius, target_index, selected=None):
                 "y1": cy + radius,
                 "line": {
                     "color": COLOR_TARGET if i == target_index else COLOR_COMP,
-                    "width": 3 if i == selected else 1.5,
+                    "width": 5 if i == selected else 3,
                 },
             }
         )
@@ -486,8 +486,7 @@ def app_payload(
 
 def render_html(meta, img_fig, lc_fig, app, movie_src):
     video_html = (
-        f'<video id="vid" muted playsinline preload="auto" '
-        f'src="{movie_src}"></video>'
+        f'<video id="vid" muted playsinline preload="auto" src="{movie_src}"></video>'
         if movie_src
         else '<div class="novideo">No movie available</div>'
     )
@@ -1124,8 +1123,7 @@ input[type=number]:focus {{ border-color: #bababa; box-shadow: 0 0 0 2px rgba(18
       const y = D.diffs[A] && D.diffs[A][sel.i];
       const isSoleAlc = !y || y.every(v => v == null);
       if (isSoleAlc) return 'comparison #' + sel.i + ' (sole ALC — showing ALC)';
-      const wtxt = w[sel.i] > 0 ? ' (weight ' + (w[sel.i] / tot).toFixed(3) + ')' : ' (not a comp here)';
-      return 'Star #' + sel.i + ' — diff. flux' + wtxt;
+      return 'Star #' + sel.i + ' — diff. flux';
     }}
     return _systAxisLabel[sel.key] || sel.key;
   }}
@@ -1348,7 +1346,10 @@ def build_report(npz_path, out_html=None, fps=15, platescale=None, crf=28, keyin
     html = render_html(meta, img_fig, lc_fig, app, movie_src)
     out_html.write_text(html)
     logger.info(
-        "Wrote report %s (%.2f MB) + assets in %s/", out_html, len(html) / 1e6, asset_rel
+        "Wrote report %s (%.2f MB) + assets in %s/",
+        out_html,
+        len(html) / 1e6,
+        asset_rel,
     )
     return out_html
 
