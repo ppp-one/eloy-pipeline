@@ -117,8 +117,20 @@ def bin_time(t, y, window_min=10):
     return np.array(bt), np.array(by), np.array(be)
 
 
-def encode_movie(frames, mp4_path, fps):
-    """Encode a (n, h, w) uint8 cube to a browser-friendly mp4; return its bytes."""
+def encode_movie(frames, mp4_path, fps, crf=28, preset="slow", keyint=1):
+    """Encode a (n, h, w) uint8 cube to a browser-friendly mp4; return its bytes.
+
+    Compression knobs (each frame is JPEG-like intra-coded by default):
+      * ``crf`` — x264 quality/size trade-off; higher is smaller and lower
+        quality (~18 visually lossless, ~28 a good balance for these grayscale
+        thumbnails). This is the main lever on file size.
+      * ``preset`` — x264 speed/efficiency preset; slower presets compress better
+        at the same crf. Encoding is one-off, so "slow" is a reasonable default.
+      * ``keyint`` — keyframe interval in frames. ``1`` means all-intra (every
+        frame a keyframe), which makes hover-scrubbing seek crisply but is the
+        largest. Values >1 add temporal compression of the near-static night
+        frames (e.g. ``fps`` for ~1 s GOP), shrinking the file several-fold more.
+    """
     f = np.asarray(frames)
     if f.ndim != 3 or f.shape[0] == 0:
         return None
@@ -136,9 +148,7 @@ def encode_movie(frames, mp4_path, fps):
         codec="libx264",
         macro_block_size=1,
         pixelformat="yuv420p",  # browser-compatible
-        # All-intra (every frame a keyframe) so hover-scrubbing seeks smoothly
-        # instead of snapping to sparse keyframes.
-        output_params=["-g", "1"],
+        output_params=["-crf", str(crf), "-preset", preset, "-g", str(max(1, keyint))],
     )
     return Path(mp4_path).read_bytes()
 
@@ -1243,7 +1253,7 @@ input[type=number]:focus {{ border-color: #bababa; box-shadow: 0 0 0 2px rgba(18
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def build_report(npz_path, out_html=None, fps=15, platescale=None):
+def build_report(npz_path, out_html=None, fps=15, platescale=None, crf=28, keyint=1):
     npz_path = Path(npz_path)
     d = dict(np.load(npz_path, allow_pickle=True))
     if platescale is None:
@@ -1282,7 +1292,7 @@ def build_report(npz_path, out_html=None, fps=15, platescale=None):
     movie = d.get("movie")
     if movie is not None and np.asarray(movie).shape[0] == len(d["time"]):
         movie = np.asarray(movie)[np.argsort(np.asarray(d["time"], float))]
-    movie_bytes = encode_movie(movie, mp4_path, fps)
+    movie_bytes = encode_movie(movie, mp4_path, fps, crf=crf, keyint=keyint)
     movie_b64 = base64.b64encode(movie_bytes).decode() if movie_bytes else ""
     if movie_bytes:
         logger.info("Wrote movie %s (%.1f MB)", mp4_path.name, len(movie_bytes) / 1e6)
@@ -1345,13 +1355,29 @@ def main():
     ap.add_argument("-o", "--out", help="output HTML path (default: alongside the npz)")
     ap.add_argument("--fps", type=int, default=15, help="night-movie frame rate")
     ap.add_argument(
+        "--crf",
+        type=int,
+        default=28,
+        help="movie quality/size (x264 CRF; higher = smaller, ~18 best quality, ~28 balanced)",
+    )
+    ap.add_argument(
+        "--keyint",
+        type=int,
+        default=1,
+        metavar="N",
+        help="movie keyframe interval in frames (1 = all-intra/crispest scrub; "
+        "larger, e.g. --keyint 15, adds temporal compression for a much smaller file)",
+    )
+    ap.add_argument(
         "--platescale",
         type=float,
         default=None,
         help=f"plate scale in arcsec/pixel (default: read from npz or {DEFAULT_PLATESCALE})",
     )
     args = ap.parse_args()
-    build_report(args.npz, args.out, args.fps, args.platescale)
+    build_report(
+        args.npz, args.out, args.fps, args.platescale, crf=args.crf, keyint=args.keyint
+    )
 
 
 if __name__ == "__main__":

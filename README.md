@@ -119,8 +119,18 @@ Reads the `night_report_...npz` bundle and writes a self-contained HTML file
 uv run night_report.py night_report_<telescope>_<filter>_<target>_<date>.npz \
   [-o report.html] \
   [--fps 15] \
+  [--crf 28] \      # movie quality/size; higher = smaller file (~18 best, ~28 balanced)
+  [--keyint 1] \    # movie keyframe interval; 1 = all-intra, larger (e.g. 15) = smaller
   [--platescale 0.348]
 ```
 
 The output HTML file is fully self-contained and opens in any modern browser
 without a server.
+
+The embedded night movie is the dominant contributor to report size. It is
+encoded with x264 at `--crf 28` (each frame JPEG-like intra-coded) by default,
+which keeps hover-scrubbing crisp. Raise `--crf` for a smaller file, or set
+`--keyint` above 1 to add temporal compression of the near-static frames (this
+helps real sky data but not noise-dominated frames). These options also apply
+when the pipeline builds the report via `--report` only through its defaults; run
+`night_report.py` directly to tune them.
