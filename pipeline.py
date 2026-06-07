@@ -75,10 +75,10 @@ logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore", message="You are sending unauthenticated requests.*")
 
 # --- Detection / photometry parameters -------------------------------------
-N_STARS = 400  # number of stars to track for photometry
+N_STARS = 100  # number of stars to track for photometry
 CUTOUT_SHAPE = (31, 31)  # cutout size (pixels) used for PSF/centroiding
 TRIM = 20  # pixels trimmed from each image edge before processing
-SATURATED = 64000 * 0.9  # peak counts above which a star is treated as saturated
+SATURATED = 64000 * 0.9  # peak counts considered saturated after calibration (ADU)
 
 N_STARS_ALIGN = 12  # number of brightest stars used to solve frame alignment
 RELATIVE_RADII = np.linspace(0.5, 5, 40)  # aperture radii, in units of FWHM
@@ -88,8 +88,6 @@ N_WORKERS = os.cpu_count() or 4  # worker processes for the parallel main loop
 
 MOVIE_MAX_PX = 512  # longest side of the saved night-movie frames (downsampled)
 DEFAULT_PLATESCALE = 0.348  # arcsec/pixel, fallback when optics keywords absent
-
-USE_TMASS = False  # whether to query 2MASS for WCS-solving reference stars (else Gaia)
 
 # --- FITS header keywords --------------------------------------------------
 KW_DATE_OBS = "DATE-OBS"  # UTC timestamp of the exposure
@@ -201,8 +199,8 @@ def bad_pixel_map(dark_files, master_bias=None, std_factor_upper=3, std_factor_l
     for f in dark_files:
         data = fits.getdata(f).astype(float)
         exptime = fits.getheader(f)[KW_EXPTIME]
-        # if master_bias is not None:
-        #     data = data - master_bias
+        if master_bias is not None:
+            data = data - master_bias
         stack.append(data / exptime)
 
     master_dark = np.median(stack, axis=0)
@@ -271,7 +269,7 @@ def interpolate_bad_pixels(image, mask, max_adu=None):
     if max_adu is not None:
         n_above = int(np.sum(data > max_adu))
         if n_above:
-            logger.info(
+            logger.debug(
                 "interpolate_bad_pixels: %d pixel(s) above max_adu=%.0f "
                 "(hot pixels / cosmic rays / flat artefacts) — interpolating",
                 n_above,
@@ -338,7 +336,7 @@ def calibration_sequence(
         _pre = calibrated_data
         n_pre_nan = int(np.sum(~np.isfinite(_pre)))
         n_pre_zero = int(np.sum(_pre == 0))
-        logger.info(
+        logger.debug(
             "%s pre-interpolation:  %d NaN/Inf, %d exact zeros, "
             "min=%.1f  max=%.1f  median=%.1f",
             fname,
@@ -353,7 +351,7 @@ def calibration_sequence(
         )
         n_post_nan = int(np.sum(~np.isfinite(calibrated_data)))
         n_post_zero = int(np.sum(calibrated_data == 0))
-        logger.info(
+        logger.debug(
             "%s post-interpolation: %d NaN/Inf, %d exact zeros, "
             "min=%.1f  max=%.1f  median=%.1f",
             fname,
@@ -792,10 +790,10 @@ def main():
     ap.add_argument("--image_path", help="Directory containing the night's FITS files.")
     ap.add_argument("--target", help="OBJECT header value of the science target.")
     ap.add_argument(
-        "--query-name",
+        "--query-string",
         default=None,
         metavar="NAME",
-        help="Name to resolve for the target's sky coordinates (default: same as target).",
+        help="String to resolve for the target's sky coordinates (default: same as target).",
     )
     ap.add_argument(
         "--fix-bad-pixels",
@@ -811,7 +809,7 @@ def main():
     args = ap.parse_args()
     image_path = args.image_path
     target = args.target
-    query_name = args.query_name if args.query_name is not None else target
+    query_string = args.query_string if args.query_string is not None else target
     fix_bad_pixels = args.fix_bad_pixels
 
     # =======================================================================
@@ -942,20 +940,39 @@ def main():
 
     # Query Gaia over a slightly larger area than the FOV to allow for pointing error.
     logger.info("Querying Gaia and solving WCS...")
+    use_tmass = False
+    if target_filter in ["zYJ", "Y", "J", "H", "Ks"]:
+        use_tmass = True
+        logger.info("Target filter is '%s'; using 2MASS for WCS fit", target_filter)
     all_radecs = gaia_radecs(
         center,
         1.5 * fov,
-        tmass=USE_TMASS,
+        tmass=use_tmass,
     )
     # Match the 15 brightest detected stars to the 15 brightest Gaia sources.
     wcs = compute_wcs(ref_coords_all[0:15], all_radecs[0:15], tolerance=10)
+
+    # Check if platescale from WCS is consistent with optics keywords
+    wcs_h = wcs.to_header()  # ensure cdelt and pc are populated
+    wcs_platescale = np.abs(
+        wcs_h["CDELT1"] * wcs_h["PC1_1"]
+    )  # degrees/pixel -> arcsec/pixel
+    logger.info("WCS plate scale: %.4f arcsec/pixel", wcs_platescale * 3600)
+    if abs(wcs_platescale - pixel_scale) / (pixel_scale) > 0.1:
+        logger.error(
+            "WCS plate scale %.4f arcsec/pixel differs from optics-derived "
+            "plate scale %.4f arcsec/pixel by more than 10%%;",
+            wcs_platescale * 3600,
+            pixel_scale * 3600,
+        )
+        exit(1)
 
     # Convert reference-frame star pixel positions to sky coordinates via the
     # WCS, resolve the target's Gaia coordinates, and find which star it is.
     stars_radec = wcs.pixel_to_world(*ref_coords.T)
 
     mast = Mast()
-    target_radec = mast.resolve_object(query_name)
+    target_radec = mast.resolve_object(query_string)
     target_index = int(target_radec.match_to_catalog_sky(stars_radec)[0])
     logger.info("Target matched to star index %d", target_index)
 
@@ -1056,6 +1073,7 @@ def main():
     )
     logger.info("Best aperture index: %d", best_aperture)
 
+    logger.info("Saving night-report bundle for night_report.py...")
     # Artificial (comparison) light curve per aperture: the weighted mean of the
     # normalised comparison fluxes used to detrend the target (Broeg 2005). The
     # comparison weights differ per aperture, so this is shape (apertures, frames).
@@ -1094,7 +1112,7 @@ def main():
         **data,
     )
     logger.info(
-        'Saved night-report bundle to %s (visualise with `python night_report.py "%s"`)',
+        'Saved night-report bundle to %s (visualise with `uv run night_report.py "%s"`)',
         report_file,
         report_file,
     )
