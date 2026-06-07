@@ -1,0 +1,31 @@
+[project]
+name = "eloy_pipeline"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = "==3.11.8"
+dependencies = [
+    "eloy[jax]>=0.0.11b0",
+    "imageio-ffmpeg>=0.6.0",
+]
+
+[dependency-groups]
+dev = [
+    "cabaret",
+    "ruff",
+    "toml",
+    "pre-commit",
+    "ipykernel",
+    {include-group = "test"}
+]
+
+test = [
+  "pytest"
+]
+
+[tool.ruff]
+exclude = ["uv.lock", "*.yaml"]
+line-length = 88
+
+[tool.ruff.lint]
+fixable = ["ALL"]
