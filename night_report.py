@@ -328,8 +328,11 @@ def lightcurve_figure(d, best, target_index, platescale=DEFAULT_PLATESCALE):
         "yaxis": "y",
         "hoverinfo": "skip",
     }
+    # Binned traces must also be WebGL: plotly draws every scattergl trace on a
+    # canvas above the SVG layer, so an SVG "scatter" would sit behind the raw
+    # points. Within the WebGL layer, traces draw in list order.
     binned = {
-        "type": "scatter",
+        "type": "scattergl",
         "mode": "markers",
         "name": "binned",
         "x": jsonify(btt),
@@ -359,7 +362,7 @@ def lightcurve_figure(d, best, target_index, platescale=DEFAULT_PLATESCALE):
         "hoverinfo": "skip",
     }
     syst_binned = {
-        "type": "scatter",
+        "type": "scattergl",
         "mode": "markers",
         "name": "fwhm (binned)",
         "x": jsonify((sbt - jd0).tolist()),
