@@ -35,6 +35,7 @@ from astropy.coordinates import SkyCoord
 from astropy.io import fits
 from astropy.time import Time
 from astropy.visualization import ZScaleInterval
+from astropy.wcs.utils import proj_plane_pixel_scales
 from astroquery.mast import Mast
 from dateutil import parser
 from eloy import (
@@ -78,7 +79,7 @@ warnings.filterwarnings("ignore", message="You are sending unauthenticated reque
 # --- Detection / photometry parameters -------------------------------------
 N_STARS = 100  # number of stars to track for photometry
 CUTOUT_SHAPE = (31, 31)  # cutout size (pixels) used for PSF/centroiding
-TRIM = 20  # pixels trimmed from each image edge before processing
+TRIM = 0  # pixels trimmed from each image edge before processing
 SATURATED = 65000 * 0.9  # peak counts considered saturated after calibration (ADU)
 
 N_STARS_ALIGN = 12  # number of brightest stars used to solve frame alignment
@@ -1062,13 +1063,12 @@ def main():
             tmass=use_tmass,
         )
         # Match the 15 brightest detected stars to the 15 brightest Gaia sources.
-        wcs = compute_wcs(ref_coords_all[0:15], all_radecs[0:15], tolerance=10)
+        wcs = compute_wcs(ref_coords_all[0:20], all_radecs[0:20], tolerance=10)
 
         # Check if platescale from WCS is consistent with optics keywords
-        wcs_h = wcs.to_header()  # ensure cdelt and pc are populated
-        wcs_platescale = np.abs(
-            wcs_h["CDELT1"] * wcs_h["PC1_1"]
-        )  # degrees/pixel -> arcsec/pixel
+        # Use the full pixel->sky matrix, not PC1_1 alone: PC1_1 is scale*cos(rotation)
+        # and goes to ~0 when the camera is rotated ~90 deg on the sky.
+        wcs_platescale = np.mean(proj_plane_pixel_scales(wcs))  # degrees/pixel
         logger.info("WCS plate scale: %.4f arcsec/pixel", wcs_platescale * 3600)
         if abs(wcs_platescale - pixel_scale) / (pixel_scale) > 0.1:
             logger.error(
