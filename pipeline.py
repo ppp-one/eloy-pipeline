@@ -106,6 +106,9 @@ KW_AIRMASS = "AIRMASS"  # airmass at exposure
 KW_FOCALLEN = "FOCALLEN"  # focal length (unit read from its header comment)
 KW_XPIXSZ = "XPIXSZ"  # pixel size (microns)
 KW_TELESCOP = "TELESCOP"  # telescope name
+KW_EGAIN = "EGAIN"  # native gain (e-/ADU); not GAIN, which many cameras use for the gain setting
+KW_XBINNING = "XBINNING"  # binning factor along x
+KW_YBINNING = "YBINNING"  # binning factor along y
 
 # --- FITS frame types (values of the IMAGETYP keyword) ---------------------
 TYPE_LIGHT = "Light Frame"
@@ -448,6 +451,21 @@ def run_output_dir(output_dir, target, day_date, telescope, band) -> Path:
     )
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
+
+
+def effective_gain(header, native_gain=None):
+    """Gain of one stored (binned) pixel in e-/ADU, or None if unknown.
+
+    ``native_gain`` (e-/ADU before binning) comes from ``--gain`` or the
+    ``EGAIN`` keyword. The camera averages each binning block, so one stored ADU
+    stands for XBINNING x YBINNING native ADU.
+    """
+    if native_gain is None:
+        native_gain = header.get(KW_EGAIN)
+    if native_gain is None:
+        return None
+    binning = int(header.get(KW_XBINNING, 1)) * int(header.get(KW_YBINNING, 1))
+    return float(native_gain) * binning
 
 
 def extract_plate_scale(header) -> float:
@@ -1050,6 +1068,18 @@ def main():
         ),
     )
     ap.add_argument(
+        "--gain",
+        type=float,
+        default=None,
+        metavar="E_PER_ADU",
+        help=(
+            "Native (unbinned) detector gain in e-/ADU, used to show read noise and "
+            "dark current in electrons. The camera is assumed to average binned "
+            "pixels, so the effective gain is this times XBINNING x YBINNING. "
+            "Default: the EGAIN header keyword, if present."
+        ),
+    )
+    ap.add_argument(
         "--bias-dir",
         default=None,
         metavar="DIR",
@@ -1394,6 +1424,17 @@ def main():
             movie = movie[order]
 
         telescope_name = ref_header.get(KW_TELESCOP, "unknown")
+        gain = effective_gain(ref_header, args.gain)
+        if gain is None:
+            logger.info("Gain unknown (no --gain or EGAIN); noise stays in ADU")
+        else:
+            logger.info(
+                "Effective gain %.2f e-/ADU: read noise %.1f e-, dark current %.3g e-/s "
+                "per stored pixel",
+                gain,
+                read_noise * gain,
+                dark_current * gain,
+            )
         run_dir = run_output_dir(
             output_dir, target, day_date, telescope_name, target_filter
         )
@@ -1457,8 +1498,9 @@ def main():
             band=target_filter,
             telescope=telescope_name,
             platescale=pixel_scale * 3600,  # arcsec/pixel
-            read_noise=read_noise,
-            dark_current=dark_current,
+            read_noise=read_noise,  # ADU
+            dark_current=dark_current,  # ADU/s
+            gain=np.nan if gain is None else gain,  # e-/ADU per stored pixel
             **data,
         )
         logger.info("Saved photometry to %s", photometry_file)

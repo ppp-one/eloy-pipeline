@@ -477,6 +477,13 @@ def app_payload(
 # ---------------------------------------------------------------------------
 
 
+def _in_electrons(value, gain, fmt, unit):
+    """`` (value*gain unit)`` for a header pill, or "" when the gain is unknown."""
+    if gain is None:
+        return ""
+    return f"&nbsp;<b>({value * gain:{fmt}}&nbsp;{unit})</b>"
+
+
 def render_html(meta, img_fig, lc_fig, app, movie_src):
     video_html = (
         f'<video id="vid" muted playsinline preload="auto" src="{movie_src}"></video>'
@@ -516,10 +523,15 @@ def render_html(meta, img_fig, lc_fig, app, movie_src):
                 else None,
                 f"median&nbsp;fwhm&nbsp;<b>{meta['median_fwhm_as']:.2f}&Prime;&nbsp;({meta['median_fwhm_px']:.1f}&nbsp;px)</b>",
                 f"read noise&nbsp;<b>{meta['read_noise']:.2f}&nbsp;ADU</b>"
+                + _in_electrons(meta["read_noise"], meta["gain"], ".1f", "e&minus;")
                 if meta["read_noise"] is not None
                 else None,
                 f"dark current&nbsp;<b>{meta['dark_current']:.3g}&nbsp;ADU/s</b>"
+                + _in_electrons(meta["dark_current"], meta["gain"], ".3g", "e&minus;/s")
                 if meta["dark_current"] is not None
+                else None,
+                f"gain&nbsp;<b>{meta['gain']:.2f}&nbsp;e&minus;/ADU</b>"
+                if meta["gain"] is not None
                 else None,
             ],
         )
@@ -605,8 +617,8 @@ body {{
 .site-header {{
   background: #23292f;
   color: #fff;
-  padding: 0 28px;
-  height: 56px;
+  padding: 8px 28px;
+  min-height: 56px;
   display: flex;
   align-items: center;
   gap: 20px;
@@ -618,6 +630,8 @@ body {{
   font-weight: 600;
   color: #fff;
   letter-spacing: 0.01em;
+  white-space: nowrap;
+  flex-shrink: 0;
 }}
 .site-header .telescope-tag {{
   font-size: 12px;
@@ -628,12 +642,15 @@ body {{
   border-radius: 2px;
   padding: 2px 8px;
   letter-spacing: 0.03em;
+  white-space: nowrap;
+  flex-shrink: 0;
 }}
 .meta-pills {{
   display: flex;
   align-items: center;
   gap: 6px;
   flex-wrap: wrap;
+  justify-content: flex-end;
   margin-left: auto;
 }}
 .meta-pill {{
@@ -1353,6 +1370,7 @@ def build_report(run_path, out_html=None, fps=15, platescale=None, crf=28, keyin
     _exptime = float(np.nanmedian(d["exptime"])) if "exptime" in d else None
     _read_noise = float(d["read_noise"]) if "read_noise" in d else None
     _dark_current = float(d["dark_current"]) if "dark_current" in d else None
+    _gain = float(d["gain"]) if "gain" in d else None
     meta = {
         "target": target,
         "date": date,
@@ -1366,6 +1384,7 @@ def build_report(run_path, out_html=None, fps=15, platescale=None, crf=28, keyin
         if (_read_noise is None or math.isnan(_read_noise))
         else _read_noise,
         "dark_current": _dark_current,
+        "gain": None if (_gain is None or math.isnan(_gain)) else _gain,
         "telescope": telescope,
     }
 
