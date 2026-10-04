@@ -821,50 +821,109 @@ def _bin_residual_score(lc: np.ndarray, t: np.ndarray, bin_minutes: float) -> fl
     return float(np.std(np.concatenate(residuals)))
 
 
-MAX_COMPARISONS = 30  # most comparison stars tried per aperture
+N_COMPARISONS = 25  # comparison stars: the N nearest well-behaved stars to the target
+COMP_REJECT_MAD = 3.0  # reject stars this many MADs noisier than their brightness predicts
+COMP_REF_FWHM = 2.0  # aperture (in FWHM) at which comparison stars are judged
 
 
-def differential_photometry(fluxes, target_index, max_comps=MAX_COMPARISONS):
-    """Differential light curves and comparison-star weights for every aperture.
+def _ptp_scatter(lcs: np.ndarray) -> np.ndarray:
+    """Point-to-point scatter along the last axis (insensitive to slow trends)."""
+    return np.nanstd(np.diff(lcs, axis=-1), axis=-1) / np.sqrt(2)
 
-    Replaces ``eloy.flux.auto_diff``, which has two faults. It ranks the target
-    among the candidate comparison stars, so when the target is not the brightest
-    star the step that "adds" it changes nothing, the noise does not drop, and
-    the search stops (often with 1 comparison star). It also stops at the first
-    rise in noise. Here the target is left out of the ranking, and every count of
-    comparison stars from 1 to ``max_comps`` (in Broeg-weight order) is tried; the
-    count that gives the target the lowest white noise wins.
+
+def _ensemble_weights(norm: np.ndarray, comps, n_iter: int = 5) -> np.ndarray:
+    """Inverse-variance weights for ``comps`` (Broeg 2005 iteration).
+
+    Each star's variance is the point-to-point scatter of its light curve
+    divided by the ensemble of the other comparison stars; weights are 1/var,
+    which is the minimum-noise combination (eloy uses 1/sigma, which gives faint
+    stars too much weight).
+    """
+    w = np.zeros(norm.shape[0])
+    w[comps] = 1.0
+    for _ in range(n_iter):
+        scatter = _ptp_scatter(flux.diff(norm, w)[0])
+        new = np.zeros_like(w)
+        new[comps] = 1.0 / scatter[comps] ** 2
+        new[~np.isfinite(new)] = 0.0
+        w = new
+    return w
+
+
+def select_comparison_stars(
+    fluxes: np.ndarray,
+    target_index: int,
+    coords: np.ndarray,
+    ref_aperture: int,
+    n_comps: int = N_COMPARISONS,
+    reject_mad: float = COMP_REJECT_MAD,
+) -> tuple[list, int]:
+    """Choose one comparison set for all apertures, without using the target's light curve.
+
+    Choosing stars by how much they lower the target's noise overfits: the target
+    noise looks lower than it is, and the set does not hold up on other parts of
+    the night (tested on split halves of two nights). Instead:
+
+    1. Candidates are stars with valid fluxes in every frame and aperture.
+    2. Noisy or variable stars are rejected: each star's scatter against the
+       ensemble of the others is compared with the scatter expected for its
+       brightness (a straight-line fit of log scatter vs log flux), and stars
+       more than ``reject_mad`` MADs above it are dropped; repeated until stable.
+    3. The ``n_comps`` stars nearest the target are kept. The PSF changes over the
+       detector, so nearby stars lose a similar fraction of light outside the
+       aperture as the target does when the seeing changes.
+
+    Returns:
+        ``(comps, n_rejected)``: comparison star indices, and how many stars were
+        rejected as noisy or variable.
+    """
+    n_stars = fluxes.shape[1]
+    norm_all = fluxes / np.nanmean(fluxes, axis=-1, keepdims=True)
+    ok = np.isfinite(norm_all).all(axis=(0, 2))
+    ok[target_index] = False
+
+    f = fluxes[ref_aperture]
+    norm = norm_all[ref_aperture]
+    level = np.nanmedian(f, axis=-1)
+    ok &= level > 0
+    n_candidates = int(ok.sum())
+    while ok.sum() > 3:
+        comps = np.nonzero(ok)[0]
+        scatter = _ptp_scatter(flux.diff(norm, _ensemble_weights(norm, comps))[0])
+        x, y = np.log(level[comps]), np.log(scatter[comps])
+        slope, offset = np.polyfit(x, y, 1)
+        resid = np.log(scatter) - (slope * np.log(level) + offset)
+        mad = 1.4826 * np.median(np.abs(resid[comps] - np.median(resid[comps])))
+        bad = ok & (resid > reject_mad * mad)
+        if not bad.any():
+            break
+        ok &= ~bad
+
+    dist = np.hypot(*(coords[:n_stars] - coords[target_index]).T)
+    good = np.nonzero(ok)[0]
+    comps = good[np.argsort(dist[good])][:n_comps].tolist()
+    return comps, n_candidates - len(good)
+
+
+def differential_photometry(fluxes: np.ndarray, comps) -> tuple:
+    """Differential light curves of every star against one comparison set.
 
     Args:
         fluxes: Background-subtracted fluxes, shape ``(n_apertures, n_stars,
             n_frames)``, frames in time order.
-        target_index: Index of the science target along the star axis.
-        max_comps: Largest number of comparison stars to try.
+        comps: Comparison star indices (the same set at every aperture).
 
     Returns:
         ``(diffs, weights)`` with shapes ``(n_apertures, n_stars, n_frames)`` and
-        ``(n_apertures, n_stars)``; ``weights > 0`` marks the comparison stars.
+        ``(n_apertures, n_stars)``; weights are inverse-variance per aperture and
+        zero outside ``comps``.
     """
     diffs, weights = [], []
     for f in fluxes:  # one aperture: (n_stars, n_frames)
         norm = f / np.nanmean(f, axis=-1, keepdims=True)
-        w = flux.weights(norm)
-        candidates = [
-            s for s in np.argsort(w)[::-1] if s != target_index and w[s] > 0
-        ][:max_comps]
-        white_noise = utils.binned_nanstd(norm)
-        best_w, best_noise = None, np.inf
-        for k in range(1, len(candidates) + 1):
-            trial = np.zeros_like(w)
-            trial[candidates[:k]] = w[candidates[:k]]
-            noise = np.take(white_noise(flux.diff(norm, trial)), target_index, axis=-1)[0]
-            if np.isfinite(noise) and noise < best_noise:
-                best_w, best_noise = trial, noise
-        if best_w is None:  # no usable comparison set: fall back to all candidates
-            best_w = np.zeros_like(w)
-            best_w[candidates] = w[candidates]
-        diffs.append(flux.diff(norm, best_w).reshape(f.shape))
-        weights.append(best_w)
+        w = _ensemble_weights(norm, comps)
+        diffs.append(flux.diff(norm, w).reshape(f.shape))
+        weights.append(w)
     return np.array(diffs), np.array(weights)
 
 
@@ -1326,8 +1385,8 @@ def main():
         movie = np.array(movie)  # (n_frames, h, w) uint8
 
         # Put frames in time order. Workers return them in the order they finish,
-        # which changes between runs, and differential_photometry measures noise from
-        # consecutive frames, so its comparison weights depend on this order.
+        # which changes between runs, and the comparison weights and the aperture
+        # choice measure noise from consecutive frames, so they depend on this order.
         order = np.argsort(data["time"])
         for k in data:
             data[k] = data[k][order]
@@ -1345,8 +1404,25 @@ def main():
         # Background-subtracted fluxes, shaped (apertures, stars, frames).
         fluxes = (data["fluxes"] - data["bkg"]).T
 
-        # Differential photometry against an automatically-chosen comparison set.
-        diffs, weights = differential_photometry(fluxes, target_index)
+        # One comparison set for all apertures, chosen without the target's light
+        # curve, judged at the aperture nearest COMP_REF_FWHM x FWHM.
+        radius_fwhm = np.nanmedian(data["aperture_radii"], axis=0) / np.nanmedian(
+            data["fwhm"]
+        )
+        ref_aperture = int(np.argmin(np.abs(radius_fwhm - COMP_REF_FWHM)))
+        comps, n_rejected = select_comparison_stars(
+            fluxes, target_index, ref_coords, ref_aperture
+        )
+        if not comps:
+            raise RuntimeError("No usable comparison stars found")
+        logger.info(
+            "Comparison stars: %d nearest well-behaved stars (%d rejected as noisy "
+            "or variable): %s",
+            len(comps),
+            n_rejected,
+            comps,
+        )
+        diffs, weights = differential_photometry(fluxes, comps)
 
         # Pick the aperture that minimises the target's light-curve scatter.
         best_aperture = optimal_aperture(

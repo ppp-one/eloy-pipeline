@@ -149,23 +149,13 @@ def encode_movie(frames, mp4_path, fps, crf=28, preset="slow", keyint=1):
     return Path(mp4_path).read_bytes()
 
 
-def comparison_indices(weights, diffs, target_index, n_max=8):
-    """Pick the comparison stars (highest weight, weight > 0, excluding target).
-
-    ``auto_diff`` may return weights as 1D (per star) or with an extra aperture
-    axis; collapse to a per-star vector by averaging any non-star axes.
-    """
-    n_stars = diffs.shape[1]
+def comparison_indices(weights, target_index, aperture):
+    """Comparison stars used at ``aperture`` (weight > 0, excluding the target), highest weight first."""
     w = np.asarray(weights, float)
-    if w.ndim == 1 and w.size == n_stars:
-        w1d = w
-    elif w.ndim >= 2 and n_stars in w.shape:
-        star_axis = list(w.shape).index(n_stars)
-        w1d = np.nanmean(np.moveaxis(w, star_axis, 0).reshape(n_stars, -1), axis=1)
-    else:
-        return []
-    order = np.argsort(w1d)[::-1]
-    return [int(i) for i in order if i != target_index and w1d[i] > 0][:n_max]
+    if w.ndim == 2:
+        w = w[aperture]
+    order = np.argsort(w)[::-1]
+    return [int(i) for i in order if i != target_index and w[i] > 0]
 
 
 # ---------------------------------------------------------------------------
@@ -1308,7 +1298,7 @@ def build_report(run_path, out_html=None, fps=15, platescale=None, crf=28, keyin
     diffs = np.asarray(d["diffs"])
     n_stars = diffs.shape[1]
 
-    comps = comparison_indices(d["weights"], diffs, target_index)
+    comps = comparison_indices(d["weights"], target_index, best)
     logger.info(
         "Best aperture %d, target #%d, %d comparison stars",
         best,
