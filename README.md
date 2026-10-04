@@ -26,7 +26,7 @@ automatically by exposure time and filter, so you don't sort them yourself. Add
 reduction alone. `ffmpeg` needs to be on your `PATH` for the report's movie.
 
 If the target was observed in more than one filter the pipeline runs once per
-filter automatically, producing a separate set of output files for each.
+filter automatically, producing a separate output folder for each.
 
 ## pipeline.py
 
@@ -55,7 +55,7 @@ and a systematics panel (FWHM, sky, centroid drift, airmass).
 | `--target` | required | `OBJECT` header value of the science target. |
 | `--query-string` | `--target` | Name resolved via MAST. |
 | `--fix-bad-pixels` | off | Mask hot/dead pixels from the darks and interpolate over them before photometry. |
-| `--output-dir` | `.` | Where to write outputs; created if missing. |
+| `--output-dir` | `results` | Root folder for outputs; created if missing. Each run gets its own subfolder (see [Output](#output)). |
 | `--flat-dir` | — | Directory of flat frames that **override** those found in `--image_path`. Only files whose `IMAGETYP` header marks them as flats and whose `FILTER` matches the target filter are used. |
 | `--dark-dir` | — | Directory of dark frames that **override** those found in `--image_path`. Exposure-time matching is still applied. |
 | `--bias-dir` | — | Directory of bias frames that **override** those found in `--image_path`. |
@@ -63,15 +63,29 @@ and a systematics panel (FWHM, sky, centroid drift, airmass).
 
 ### Output
 
-Files are named `<telescope>_<filter>_<target>_<date>`, read from the headers.
+Each run writes to its own folder, `<output-dir>/<target>/<date>_<telescope>_<filter>/`.
+The telescope and filter come from the FITS headers. Characters that are not safe in
+file names become `-` (so `ETH Hongg` becomes `ETH-Hongg`, and `i'` becomes `i`).
+Grouping by target first keeps all nights of one object together. The date comes
+first in the run folder, so nights sort in order.
 
-- `photometry_data_*.npz` — per-frame fluxes, backgrounds, centroids, metadata.
-- `night_report_*.npz` — all of that plus the co-added stack, master frames,
-  differential light curves, and movie thumbnails. This is what the report reads.
+```
+results/
+└── WASP-33b/
+    └── 2026-10-02_ETH-Hongg_i/
+        ├── photometry.npz        # per-frame fluxes, backgrounds, centroids, metadata
+        ├── night_report.npz      # all of that + stack, master frames, light curves, movie
+        ├── lightcurve.pdf        # target and comparison-star light curves
+        ├── systematics.pdf       # FWHM, sky, centroid drift, airmass
+        ├── night_report.html     # interactive report (--report only)
+        └── night_report_assets/  # movie and images the report loads (--report only)
+```
+
+A second run of the same target, night, telescope and filter overwrites that folder's files.
 
 ## night_report.py
 
-Reads a `night_report_*.npz` and writes an HTML page (Plotly and D3 from a CDN)
+Reads a run folder's `night_report.npz` and writes an HTML page (Plotly and D3 from a CDN)
 you can open in any browser, with no server. The movie and stack images go in a
 sibling `<report>_assets/` folder that the page references, so keep the two
 together when you move or share a report. It gives you:
@@ -83,7 +97,7 @@ together when you move or share a report. It gives you:
 - a light/dark theme toggle.
 
 ```bash
-uv run night_report.py results/night_report_*.npz \
+uv run night_report.py results/<target>/<date>_<telescope>_<filter>/night_report.npz \
   [-o report.html] \
   [--fps 15] \
   [--crf 28] \      # movie quality: higher number = smaller file

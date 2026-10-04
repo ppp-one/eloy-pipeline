@@ -1,7 +1,7 @@
 """Build an interactive night-report web page from a pipeline report bundle.
 
-Reads the ``night_report_<target>_<date>.npz`` produced by ``pipeline.py`` and
-writes an HTML page (plus a sibling ``*_assets`` folder holding the movie and
+Reads the ``night_report.npz`` bundle that ``pipeline.py`` writes to each run
+folder and writes an HTML page (plus a sibling ``*_assets`` folder holding the movie and
 stack PNGs it references) that shows, in the style of the SPECULOOS portal:
 
   * the co-added stack with the target/comparison stars overlaid, plus buttons
@@ -16,7 +16,7 @@ The page renders with plotly.js loaded from a CDN, so no Python plotting library
 is required.
 
 Usage:
-    uv run night_report.py night_report_<target>_<date>.npz [-o report.html]
+    uv run night_report.py results/<target>/<date>_<telescope>_<filter>/night_report.npz [-o report.html]
 """
 
 import argparse
@@ -528,7 +528,7 @@ def render_html(meta, img_fig, lc_fig, app, movie_src):
                 f"read noise&nbsp;<b>{meta['read_noise']:.2f}&nbsp;ADU</b>"
                 if meta["read_noise"] is not None
                 else None,
-                f"dark current&nbsp;<b>{meta['dark_current']:.4f}&nbsp;ADU/s</b>"
+                f"dark current&nbsp;<b>{meta['dark_current']:.3g}&nbsp;ADU/s</b>"
                 if meta["dark_current"] is not None
                 else None,
             ],
@@ -1362,7 +1362,7 @@ def main():
         description="Build an interactive night-report web page."
     )
     ap.add_argument(
-        "npz", help="night_report_<target>_<date>.npz produced by pipeline.py"
+        "npz", help="night_report.npz bundle from a pipeline.py run folder"
     )
     ap.add_argument("-o", "--out", help="output HTML path (default: alongside the npz)")
     ap.add_argument("--fps", type=int, default=15, help="night-movie frame rate")

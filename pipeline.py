@@ -20,6 +20,7 @@ import argparse
 import logging
 import math
 import os
+import re
 import threading
 import warnings
 from collections import Counter, defaultdict
@@ -32,6 +33,7 @@ from pathlib import Path
 import matplotlib
 import numpy as np
 from astropy.coordinates import SkyCoord
+from astropy.stats import sigma_clipped_stats
 from astropy.io import fits
 from astropy.time import Time
 from astropy.visualization import ZScaleInterval
@@ -227,6 +229,30 @@ def bad_pixel_map(dark_files, master_bias=None, std_factor_upper=3, std_factor_l
     return mask
 
 
+def estimate_dark_current(dark_files, bias_files) -> float:
+    """Typical dark current of one pixel, in ADU/s.
+
+    Raw frames are integers, and on a cooled camera the dark signal per exposure
+    is far below 1 ADU. A median over frames or pixels then snaps to a
+    quantisation step (often exactly 0), so the median master dark cannot be
+    used. Instead the bias and dark frames are mean-combined, and a sigma-clipped
+    mean is taken over pixels; the clipping removes hot pixels and cosmic rays.
+    """
+    bias = 0.0
+    for f in bias_files:
+        bias = bias + fits.getdata(f).astype(float)
+    bias = bias / len(bias_files) if bias_files else 0.0
+
+    dark = 0.0
+    for f in dark_files:
+        data, header = fits.getdata(f, header=True)
+        dark = dark + (data.astype(float) - bias) / header[KW_EXPTIME]
+    dark = dark / len(dark_files)
+
+    mean, _, _ = sigma_clipped_stats(dark, sigma=3)
+    return float(mean)
+
+
 def interpolate_bad_pixels(image, mask, max_adu=None):
     """Replace bad pixels with the mean of their valid cardinal neighbours.
 
@@ -398,6 +424,30 @@ def calibration_sequence(
     )
 
     return calibrated_data, region_coords_filtered, region_coords, fwhm, regions, header
+
+
+def _safe_name(value) -> str:
+    """Make ``value`` safe as one path component (e.g. "ETH Hongg" -> "ETH-Hongg", "i'" -> "i").
+
+    Letters, digits and ``. _ + -`` are kept; every other run of characters
+    becomes a single ``-``.
+    """
+    return re.sub(r"[^A-Za-z0-9._+-]+", "-", str(value)).strip("-") or "unknown"
+
+
+def run_output_dir(output_dir, target, day_date, telescope, band) -> Path:
+    """Folder for one pipeline run: ``<output_dir>/<target>/<date>_<telescope>_<band>/``.
+
+    Grouping by target first keeps all nights of one object together; the date
+    leads the run folder so nights sort chronologically.
+    """
+    run_dir = (
+        Path(output_dir)
+        / _safe_name(target)
+        / f"{day_date}_{_safe_name(telescope)}_{_safe_name(band)}"
+    )
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
 
 
 def extract_plate_scale(header) -> float:
@@ -804,9 +854,12 @@ def main():
     )
     ap.add_argument(
         "--output-dir",
-        default=".",
+        default="results",
         metavar="DIR",
-        help="Directory to write output files to (created if needed; default: current directory).",
+        help=(
+            "Root directory for outputs (created if needed; default: results). Each run "
+            "writes to its own folder, <DIR>/<target>/<date>_<telescope>_<filter>/."
+        ),
     )
     ap.add_argument(
         "--flat-dir",
@@ -1018,10 +1071,9 @@ def main():
         DARK = calibration.master_dark(bias=BIAS, files=darks)
         FLAT = calibration.master_flat(files=flats, dark=DARK, bias=BIAS)
 
-        # Dark current: median pixel value of the master dark, which calibration.
-        # master_dark already returns bias-subtracted and normalised to ADU/s.
-        dark_current = float(np.nanmedian(DARK))
-        logger.info("Dark current estimate: %.4f ADU/s", dark_current)
+        # Not np.median(DARK): see estimate_dark_current for why that gives 0.
+        dark_current = estimate_dark_current(darks, bias)
+        logger.info("Dark current estimate: %.3g ADU/s", dark_current)
 
         # Bad-pixel mask (computed per filter; passed to every calibration_sequence call).
         bp_mask = bad_pixel_map(darks, master_bias=BIAS) if fix_bad_pixels else None
@@ -1160,13 +1212,10 @@ def main():
 
         # Persist the raw photometry products for later analysis.
         telescope_name = ref_header.get(KW_TELESCOP, "unknown")
-        safe_target_filter = (
-            target_filter.replace(" ", "-").replace("/", "-").replace("'", "")
+        run_dir = run_output_dir(
+            output_dir, target, day_date, telescope_name, target_filter
         )
-        output_file = (
-            output_dir
-            / f"photometry_data_{telescope_name}_{safe_target_filter}_{target}_{day_date}.npz"
-        )
+        output_file = run_dir / "photometry.npz"
         np.savez(
             output_file,
             platescale=pixel_scale * 3600,
@@ -1204,10 +1253,7 @@ def main():
         # =======================================================================
         # Save the night-report bundle (data + images + movie) for night_report.py
         # =======================================================================
-        report_file = (
-            output_dir
-            / f"night_report_{telescope_name}_{safe_target_filter}_{target}_{day_date}.npz"
-        )
+        report_file = run_dir / "night_report.npz"
         np.savez_compressed(
             report_file,
             stack=stack,
@@ -1239,7 +1285,6 @@ def main():
         # =======================================================================
         # Diagnostic figures
         # =======================================================================
-        fig_prefix = f"{telescope_name}_{safe_target_filter}_{target}_{day_date}"
         platescale_as = pixel_scale * 3600  # arcsec / pixel
 
         t_jd = data["time"]
@@ -1338,7 +1383,7 @@ def main():
             if row == n_rows_comp:
                 ax.set_xlabel(f"JD − {jd0}", fontsize=7)
 
-        lc_path = output_dir / f"lc_{fig_prefix}.pdf"
+        lc_path = run_dir / "lightcurve.pdf"
         fig1.savefig(lc_path, bbox_inches="tight")
         logger.info("Saved light-curve figure to %s", lc_path)
         plt.close(fig1)
@@ -1444,7 +1489,7 @@ def main():
         for ax in axes2:
             ax.tick_params(labelsize=9)
 
-        syst_path = output_dir / f"systematics_{fig_prefix}.pdf"
+        syst_path = run_dir / "systematics.pdf"
         fig2.savefig(syst_path, bbox_inches="tight")
         logger.info("Saved systematics figure to %s", syst_path)
         plt.close(fig2)
@@ -1459,6 +1504,8 @@ def main():
             from night_report import build_report
 
             build_report(report_file)
+
+        logger.info("All outputs for filter '%s' are in %s/", target_filter, run_dir)
 
 
 if __name__ == "__main__":
