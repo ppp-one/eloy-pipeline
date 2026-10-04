@@ -108,7 +108,9 @@ def bin_time(t, y, window_min=10):
         seg = y[i:j]
         bt.append(float(np.mean(t[i:j])))
         by.append(float(np.nanmean(seg)))
-        be.append(float(np.nanstd(seg) / np.sqrt(max(1, len(seg)))))
+        # Sample std (ddof=1); NaN for a single point, as in the page's JS.
+        sd = float(np.nanstd(seg, ddof=1)) if np.sum(np.isfinite(seg)) > 1 else np.nan
+        be.append(sd / np.sqrt(max(1, len(seg))))
         i = j
     return np.array(bt), np.array(by), np.array(be)
 
@@ -759,6 +761,8 @@ body {{
 }}
 .controls-label {{ font-weight: 500; color: var(--text); white-space: nowrap; }}
 .controls-hint  {{ color: var(--text-muted); font-style: italic; font-size: 11px; }}
+.controls-stat  {{ margin-left: 12px; color: var(--text); white-space: nowrap; }}
+.controls-stat b {{ font-weight: 600; }}
 
 /* ── Aperture slider ───────────────────────────────────────────── */
 #aplab {{
@@ -875,6 +879,7 @@ input[type=number]:focus {{ border-color: #bababa; box-shadow: 0 0 0 2px rgba(18
           <input type="number" min="1" max="120" value="10" step="1"
                  oninput="setBinning(+this.value)"/>
           <span class="controls-hint">min</span>
+          <span id="binsd" class="controls-stat" title="Median over bins. Per bin: standard deviation of the bin mean (sigma / sqrt(n)), the size of the error bars; assumes white noise, so correlated noise makes the true scatter of binned points larger. Per point: standard deviation of single exposures within a bin."></span>
         </div>
 
         <!-- Comparison star ALC summary -->
@@ -1064,7 +1069,7 @@ input[type=number]:focus {{ border-color: #bababa; box-shadow: 0 0 0 2px rgba(18
   function binTime(t, y, win) {{
     const o = [...t.keys()].sort((a, b) => t[a] - t[b]);
     const ts = o.map(i => t[i]), ys = o.map(i => y[i]);
-    const bt = [], by = [], be = [];
+    const bt = [], by = [], be = [], bsd = [];
     let i = 0;
     while (i < ts.length) {{
       let j = i;
@@ -1073,12 +1078,21 @@ input[type=number]:focus {{ border-color: #bababa; box-shadow: 0 0 0 2px rgba(18
       const segY = ys.slice(i, j).filter(v => v != null && !isNaN(v));
       const n = Math.max(1, segY.length);
       const m = segY.reduce((a, b) => a + b, 0) / n;
-      const sd = Math.sqrt(segY.reduce((a, b) => a + (b - m) * (b - m), 0) / n);
+      // Sample standard deviation (n - 1); undefined for a single point.
+      const sd = n > 1 ? Math.sqrt(segY.reduce((a, b) => a + (b - m) * (b - m), 0) / (n - 1)) : NaN;
       bt.push(segT.reduce((a, b) => a + b, 0) / segT.length);
-      by.push(m); be.push(sd / Math.sqrt(n));
+      by.push(m); be.push(sd / Math.sqrt(n)); bsd.push(sd);
       i = j;
     }}
-    return {{ bt, by, be }};
+    return {{ bt, by, be, bsd }};
+  }}
+
+  // Median of a per-bin quantity (finite values only), in ppt.
+  function medianPpt(vals) {{
+    const v = vals.filter(x => isFinite(x)).sort((a, b) => a - b);
+    if (!v.length) return NaN;
+    const h = v.length >> 1;
+    return 1e3 * (v.length % 2 ? v[h] : (v[h - 1] + v[h]) / 2);
   }}
 
   // Comparison stars (and their weights) are aperture-dependent: the subset with
@@ -1162,6 +1176,12 @@ input[type=number]:focus {{ border-color: #bababa; box-shadow: 0 0 0 2px rgba(18
     const b = binTime(D.time, y, binMin / 1440);
     Plotly.restyle('lc', {{ y: [y] }}, [RAW]);
     Plotly.restyle('lc', {{ x: [b.bt.map(v => v - D.jd0)], y: [b.by], 'error_y.array': [b.be] }}, [TBIN]);
+    // Per bin: sigma of the bin mean (sigma/sqrt(n), the error-bar size); per point:
+    // sigma of single exposures within a bin. Both are medians over bins.
+    const perBin = medianPpt(b.be), perPoint = medianPpt(b.bsd);
+    document.getElementById('binsd').innerHTML = isFinite(perBin)
+      ? `&sigma; per bin <b>${{perBin.toFixed(2)}}&nbsp;ppt</b>`
+        + ` <span class="controls-hint">(per point ${{perPoint.toFixed(2)}}&nbsp;ppt)</span>` : '';
   }}
 
   function setSyst(key) {{ sel = {{ type: 'syst', key }}; renderSyst(); refreshShapes(); }}
@@ -1260,7 +1280,7 @@ input[type=number]:focus {{ border-color: #bababa; box-shadow: 0 0 0 2px rgba(18
   lcDiv.addEventListener('mouseleave', function() {{ _spike.style.opacity = 0; }});
 
   // Initial render of the aperture-dependent overlays.
-  _setApLabel(D.best); _redraw(); _renderOverlay(); renderCompList();
+  _setApLabel(D.best); _redraw(); _renderOverlay(); renderCompList(); updateTarget();
   // Apply saved/OS theme (also sets the button icon and syncs Plotly colours).
   _applyTheme(localStorage.getItem('theme') ||
               (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
