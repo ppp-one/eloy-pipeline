@@ -37,7 +37,10 @@ What it does, per run:
 2. Builds master bias, dark, and flat frames; estimates read noise and dark
    current.
 3. Takes the middle light frame as a reference, detects its stars, solves a WCS
-   against Gaia (2MASS for infrared filters), and locates the target via MAST.
+   against Gaia DR3 (2MASS for infrared filters), and locates the target via MAST.
+   The catalogue comes from VizieR (CDS, then its CfA mirror), with the ESA Gaia
+   archive as the last fallback. astroquery caches the result, so later runs of
+   the same field skip the network.
 4. Processes every light frame in parallel: calibrate, align to the reference,
    refine centroids with the Ballet CNN, then aperture photometry over 40 radii
    (0.5 to 5x FWHM), co-adding a stack as it goes.

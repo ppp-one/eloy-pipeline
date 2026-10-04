@@ -22,6 +22,7 @@ import math
 import os
 import re
 import threading
+import time
 import warnings
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -57,7 +58,6 @@ matplotlib.use("Agg")
 import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
-from twirl.queries import gaia_radecs
 from twirl.utils import compute_wcs
 
 logging.basicConfig(
@@ -476,6 +476,116 @@ def extract_plate_scale(header) -> float:
             DEFAULT_PLATESCALE,
         )
         return DEFAULT_PLATESCALE / 3600  # arcsec/pixel -> deg/pixel
+
+
+# --- Reference-star catalogue for the WCS fit --------------------------------
+# VizieR (CDS) answers in ~1 s and sorts by magnitude on the server. The ESA Gaia
+# archive is often slow or times out (it is being prepared for Gaia DR4), so it
+# is only the last fallback. VizieR results are cached on disk by astroquery, so
+# repeat runs of the same field need no network.
+VIZIER_SERVERS = ("vizier.cds.unistra.fr", "vizier.cfa.harvard.edu")
+ESA_TAP_SYNC = "https://gea.esac.esa.int/tap-server/tap/sync"
+CATALOG_TIMEOUT = 30  # seconds without an answer before a service counts as failed
+CATALOG_ROUNDS = 2  # times to try the whole list of services
+GAIA_DR3_EPOCH = 2016.0  # Julian year of Gaia DR3 positions
+
+
+def _float_column(table, name):
+    """Table column as a float array, with masked entries set to NaN."""
+    return np.ma.asarray(table[name].data, dtype=float).filled(np.nan)
+
+
+def _vizier_stars(server, center, radius_deg, infrared, n):
+    """Brightest ``n`` stars in the cone from one VizieR server: (ra, dec, pmra, pmdec)."""
+    import astropy.units as u
+    from astroquery.vizier import Vizier
+
+    if infrared:  # 2MASS, sorted by J; no proper motions
+        catalog, ra_col, dec_col, cols = "II/246/out", "RAJ2000", "DEJ2000", ["+Jmag"]
+    else:  # Gaia DR3, sorted by G
+        catalog, ra_col, dec_col, cols = "I/355/gaiadr3", "RA_ICRS", "DE_ICRS", ["pmRA", "pmDE", "+Gmag"]
+    vizier = Vizier(
+        columns=[ra_col, dec_col, *cols],
+        row_limit=n,
+        timeout=CATALOG_TIMEOUT,
+        vizier_server=server,
+    )
+    tables = vizier.query_region(center, radius=radius_deg * u.deg, catalog=catalog)
+    if len(tables) == 0:
+        raise RuntimeError(f"no {catalog} sources returned")
+    t = tables[0]
+    ra, dec = _float_column(t, ra_col), _float_column(t, dec_col)
+    if infrared:
+        return ra, dec, np.zeros_like(ra), np.zeros_like(ra)
+    return ra, dec, _float_column(t, "pmRA"), _float_column(t, "pmDE")
+
+
+def _esa_stars(center, radius_deg, n):
+    """Brightest ``n`` Gaia DR3 stars from the ESA archive: (ra, dec, pmra, pmdec).
+
+    Sorting is done here, not with ORDER BY: on the archive, ORDER BY over a cone
+    makes the query far slower. A plain HTTP request is used so the timeout is
+    enforced (astroquery.gaia can wait forever).
+    """
+    import requests
+    from astropy.table import Table
+
+    query = (
+        "SELECT ra, dec, pmra, pmdec, phot_g_mean_mag FROM gaiadr3.gaia_source "
+        f"WHERE 1=CONTAINS(POINT('ICRS', ra, dec), "
+        f"CIRCLE('ICRS', {center.ra.deg}, {center.dec.deg}, {radius_deg})) "
+        "AND phot_g_mean_mag < 16"
+    )
+    r = requests.post(
+        ESA_TAP_SYNC,
+        data={"REQUEST": "doQuery", "LANG": "ADQL", "FORMAT": "csv", "QUERY": query},
+        timeout=(10, CATALOG_TIMEOUT),
+    )
+    r.raise_for_status()
+    t = Table.read(r.text, format="ascii.csv")
+    t = t[np.argsort(_float_column(t, "phot_g_mean_mag"))][:n]
+    cols = ("ra", "dec", "pmra", "pmdec")
+    return tuple(_float_column(t, c) for c in cols)
+
+
+def reference_star_radecs(center, radius_deg, infrared=False, obs_jyear=None, n=200):
+    """RA/Dec (deg) of the ``n`` brightest catalogue stars in a cone, brightest first.
+
+    Uses Gaia DR3 (2MASS when ``infrared``, which ranks stars by J as the camera
+    sees them). Services are tried in order, VizieR first; the whole list is
+    tried ``CATALOG_ROUNDS`` times. When ``obs_jyear`` is given, Gaia positions
+    are moved from the DR3 epoch to that date with their proper motions.
+
+    Returns an ``(n, 2)`` array. Raises ``RuntimeError`` if every service fails.
+    """
+    services = [
+        (f"VizieR {s}", lambda s=s: _vizier_stars(s, center, radius_deg, infrared, n))
+        for s in VIZIER_SERVERS
+    ]
+    if not infrared:  # the ESA archive has no fast 2MASS-ordered query
+        services.append(("ESA Gaia archive", lambda: _esa_stars(center, radius_deg, n)))
+
+    for attempt in range(1, CATALOG_ROUNDS + 1):
+        for name, fetch in services:
+            try:
+                ra, dec, pmra, pmdec = fetch()
+            except Exception as e:
+                logger.warning("%s query failed: %s: %s", name, type(e).__name__, e)
+                continue
+            if len(ra) == 0:
+                logger.warning("%s returned no stars", name)
+                continue
+            logger.info("Got %d reference stars from %s", len(ra), name)
+            if obs_jyear is not None and not infrared:
+                # pmRA already includes cos(dec); both are in mas/yr.
+                years = obs_jyear - GAIA_DR3_EPOCH
+                ra = ra + years * np.nan_to_num(pmra) / 3.6e6 / np.cos(np.radians(dec))
+                dec = dec + years * np.nan_to_num(pmdec) / 3.6e6
+            return np.column_stack([ra, dec])
+        if attempt < CATALOG_ROUNDS:
+            logger.warning("All catalogue services failed; retrying in %d s", 10 * attempt)
+            time.sleep(10 * attempt)
+    raise RuntimeError("Could not get reference stars from any catalogue service")
 
 
 _ZSCALE = ZScaleInterval()  # DS9-style display limits, shared with night_report.py
@@ -1103,19 +1213,25 @@ def main():
         center = SkyCoord(ref_header[KW_RA], ref_header[KW_DEC], unit="deg")
         logger.info("Plate scale: %.4f arcsec/pixel", pixel_scale * 3600)
 
-        # Query Gaia over a slightly larger area than the FOV to allow for pointing error.
-        logger.info("Querying Gaia and solving WCS...")
-        use_tmass = False
-        if target_filter in ["zYJ", "Y", "J", "H", "Ks"]:
-            use_tmass = True
+        # Query a cone of radius 0.75 * FOV (as before) to allow for pointing error.
+        logger.info("Querying reference stars and solving WCS...")
+        use_tmass = target_filter in ["zYJ", "Y", "J", "H", "Ks"]
+        if use_tmass:
             logger.info("Target filter is '%s'; using 2MASS for WCS fit", target_filter)
-        all_radecs = gaia_radecs(
+        all_radecs = reference_star_radecs(
             center,
-            1.5 * fov,
-            tmass=use_tmass,
+            0.75 * fov,
+            infrared=use_tmass,
+            obs_jyear=Time(parser.parse(ref_header[KW_DATE_OBS])).jyear,
         )
-        # Match the 15 brightest detected stars to the 15 brightest Gaia sources.
+        # Match the 20 brightest detected stars to the 20 brightest catalogue stars.
         wcs = compute_wcs(ref_coords_all[0:20], all_radecs[0:20], tolerance=10)
+        if wcs is None:
+            logger.error(
+                "WCS fit failed: no match between the brightest detected and "
+                "catalogue stars (clouds, wrong pointing, or too few stars?)"
+            )
+            exit(1)
 
         # Check if platescale from WCS is consistent with optics keywords
         # Use the full pixel->sky matrix, not PC1_1 alone: PC1_1 is scale*cos(rotation)
