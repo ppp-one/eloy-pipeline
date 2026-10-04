@@ -55,8 +55,6 @@ from eloy.ballet import Ballet
 from skimage.transform import AffineTransform
 
 matplotlib.use("Agg")
-import matplotlib.gridspec as gridspec
-import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
 from twirl.utils import compute_wcs
 
@@ -100,6 +98,10 @@ KW_IMAGETYP = "IMAGETYP"  # frame type (Light/Dark/Flat/Bias Frame)
 KW_OBJECT = "OBJECT"  # target name
 KW_FILTER = "FILTER"  # filter name
 KW_LONGITUDE = "LONG-OBS"  # site longitude (deg)
+KW_LATITUDE = "LAT-OBS"  # site latitude (deg)
+KW_ALTITUDE = "ALT-OBS"  # site altitude (m)
+KW_APTDIA = "APTDIA"  # telescope aperture diameter (m)
+KW_CAMERA = "CAM-SNAM"  # camera sensor name
 KW_RA = "RA"  # pointing right ascension
 KW_DEC = "DEC"  # pointing declination
 KW_AIRMASS = "AIRMASS"  # airmass at exposure
@@ -451,6 +453,28 @@ def run_output_dir(output_dir, target, day_date, telescope, band) -> Path:
     )
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
+
+
+def mid_exposure_bjd_tdb(jd_start, exptime, target, header):
+    """Mid-exposure BJD_TDB for exposure-start JD_UTC times.
+
+    Uses the site from LAT-OBS/LONG-OBS/ALT-OBS (geocentre if missing; the
+    difference is under 0.03 s) and the target's sky position for the
+    light-travel time to the solar-system barycentre.
+    """
+    from astropy.coordinates import EarthLocation
+
+    try:
+        site = EarthLocation.from_geodetic(
+            lon=float(header[KW_LONGITUDE]),
+            lat=float(header[KW_LATITUDE]),
+            height=float(header.get(KW_ALTITUDE, 0.0)),
+        )
+    except (KeyError, TypeError, ValueError):
+        site = EarthLocation.from_geocentric(0, 0, 0, unit="m")
+    half_exposure = np.nan_to_num(np.asarray(exptime, float)) / 2 / 86400
+    mid = Time(np.asarray(jd_start) + half_exposure, format="jd", scale="utc", location=site)
+    return (mid.tdb + mid.light_travel_time(target)).jd
 
 
 def effective_gain(header, native_gain=None):
@@ -955,8 +979,8 @@ def optimal_aperture(
 
     Two metrics are computed on the target's light curve at each aperture:
     point-to-point scatter and the scatter within ``bin_minutes`` bins. Both only
-    see noise on time scales of a few minutes, so slow astrophysical signals
-    (transits lasting hours, pulsations of ~1 h) barely change them. Apertures are
+    see noise on time scales of a few minutes, so astrophysical variability on
+    time scales of an hour or more barely changes them. Apertures are
     ranked on each metric and the lowest combined rank wins.
 
     The comparison stars are not used to score apertures: each aperture has its
@@ -992,27 +1016,6 @@ def optimal_aperture(
         binned[best],
     )
     return best
-
-
-def _bin_lc(t_arr, y_arr, bin_min=10.0):
-    """Bin (t, y) into ``bin_min``-minute windows; return (t_bin, y_bin, e_bin)."""
-    w = bin_min / (24 * 60)
-    order = np.argsort(t_arr)
-    ts, ys = t_arr[order], y_arr[order]
-    bt, by, be = [], [], []
-    i = 0
-    while i < len(ts):
-        j = i
-        while j < len(ts) and ts[j] - ts[i] < w:
-            j += 1
-        seg = ys[i:j]
-        fin = seg[np.isfinite(seg)]
-        if len(fin):
-            bt.append(float(np.mean(ts[i:j])))
-            by.append(float(np.mean(fin)))
-            be.append(float(np.std(fin) / np.sqrt(max(1, len(fin)))))
-        i = j
-    return np.array(bt), np.array(by), np.array(be)
 
 
 def main():
@@ -1480,6 +1483,12 @@ def main():
             wsum == 0, np.nan, wsum
         )
 
+        # Mid-exposure BJD_TDB, the standard time scale for time-series photometry.
+        # data["time"] stays the exposure-start JD_UTC that the HTML report uses.
+        bjd_tdb = mid_exposure_bjd_tdb(
+            data["time"], data["exptime"], target_radec, ref_header
+        )
+
         # =======================================================================
         # Save results: each array goes into exactly one file
         # =======================================================================
@@ -1501,6 +1510,18 @@ def main():
             read_noise=read_noise,  # ADU
             dark_current=dark_current,  # ADU/s
             gain=np.nan if gain is None else gain,  # e-/ADU per stored pixel
+            bjd_tdb=bjd_tdb,
+            target_ra=target_radec.ra.deg,
+            target_dec=target_radec.dec.deg,
+            site_lat=float(ref_header.get(KW_LATITUDE, np.nan)),
+            site_lon=float(ref_header.get(KW_LONGITUDE, np.nan)),
+            site_alt=float(ref_header.get(KW_ALTITUDE, np.nan)),
+            aperture_diameter=float(ref_header.get(KW_APTDIA, np.nan)),  # m
+            camera=str(ref_header.get(KW_CAMERA, "")),
+            wcs_header=wcs.to_header().tostring(sep="\n"),
+            n_rejected_comps=n_rejected,
+            n_light_frames=len(filter_light_frames),
+            saturation=SATURATED,  # ADU
             **data,
         )
         logger.info("Saved photometry to %s", photometry_file)
@@ -1523,216 +1544,11 @@ def main():
         )
 
         # =======================================================================
-        # Diagnostic figures
+        # PDF summary (observing log, light curve, noise, systematics, comparisons)
         # =======================================================================
-        platescale_as = pixel_scale * 3600  # arcsec / pixel
+        from pdf_report import build_pdf
 
-        t_jd = data["time"]
-        jd0 = int(np.floor(t_jd.min()))
-        # Frames are already time-sorted above; this keeps the plots safe if that
-        # ever changes.
-        _order = np.argsort(t_jd)
-        t_plot = (t_jd - jd0)[_order]
-
-        target_lc = diffs[best_aperture, target_index][_order]
-        bt_t, by_t, be_t = _bin_lc(t_plot, target_lc)
-
-        # Comparison stars with non-zero weight at the best aperture.
-        comp_idx = [
-            i
-            for i in range(diffs.shape[1])
-            if i != target_index and weights[best_aperture, i] > 0
-        ]
-        w_total = weights[best_aperture, comp_idx].sum() or 1.0
-
-        # ── Figure 1: target LC + comparison star subplots ───────────────────
-        n_comps = len(comp_idx)
-        n_cols = min(4, max(1, n_comps))
-        n_rows_comp = math.ceil(n_comps / n_cols) if n_comps else 0
-
-        fig1 = plt.figure(figsize=(max(8, 3.5 * n_cols), 3.5 + 2.2 * n_rows_comp))
-        gs1 = gridspec.GridSpec(
-            1 + n_rows_comp,
-            n_cols,
-            figure=fig1,
-            height_ratios=[3] + [1.8] * n_rows_comp,
-            hspace=0.45,
-            wspace=0.35,
-        )
-
-        ax_top = fig1.add_subplot(gs1[0, :])
-        ax_top.scatter(
-            t_plot,
-            target_lc,
-            s=4,
-            c="0.65",
-            alpha=0.5,
-            linewidths=0,
-            rasterized=True,
-        )
-        ax_top.errorbar(
-            bt_t,
-            by_t,
-            be_t,
-            fmt="o",
-            ms=5,
-            color="#2166ac",
-            elinewidth=1,
-            capsize=2,
-            label="10-min bins",
-            zorder=3,
-        )
-        ax_top.axhline(1, lw=0.8, ls="--", color="0.45")
-        ax_top.set_ylabel("Diff. flux")
-        ax_top.set_title(
-            f"{target}  ·  {target_filter}  ·  aperture {best_aperture}  ·  {day_date}",
-            fontsize=10,
-        )
-        ax_top.legend(fontsize=8, frameon=False)
-        if n_rows_comp:
-            ax_top.tick_params(labelbottom=False)
-        else:
-            ax_top.set_xlabel(f"JD − {jd0}")
-
-        for k, ci in enumerate(comp_idx):
-            row = 1 + k // n_cols
-            col = k % n_cols
-            ax = fig1.add_subplot(gs1[row, col])
-            lc_c = diffs[best_aperture, ci][_order]
-            bt_c, by_c, be_c = _bin_lc(t_plot, lc_c)
-            ax.scatter(
-                t_plot, lc_c, s=2, c="0.7", alpha=0.4, linewidths=0, rasterized=True
-            )
-            ax.errorbar(
-                bt_c,
-                by_c,
-                be_c,
-                fmt="o",
-                ms=3,
-                color="#d6604d",
-                elinewidth=0.6,
-                capsize=1.5,
-                zorder=3,
-            )
-            w_frac = weights[best_aperture, ci] / w_total
-            ax.set_title(f"comp #{ci}  w = {w_frac:.3f}", fontsize=7)
-            ax.set_ylim(0.96, 1.04)
-            ax.tick_params(labelsize=7)
-            if col == 0:
-                ax.set_ylabel("Diff. flux", fontsize=7)
-            if row == n_rows_comp:
-                ax.set_xlabel(f"JD − {jd0}", fontsize=7)
-
-        lc_path = run_dir / "lightcurve.pdf"
-        fig1.savefig(lc_path, bbox_inches="tight")
-        logger.info("Saved light-curve figure to %s", lc_path)
-        plt.close(fig1)
-
-        # ── Figure 2: target LC + systematics ────────────────────────────────
-        fwhm_as = data["fwhm"][_order] * platescale_as
-        sky_adu_s = data["sky"][_order] / data["exptime"][_order]
-
-        fig2, axes2 = plt.subplots(
-            5,
-            1,
-            figsize=(10, 12),
-            sharex=True,
-            gridspec_kw={"height_ratios": [3, 1.5, 1.5, 1.5, 1.5], "hspace": 0.06},
-        )
-
-        # Target light curve
-        axes2[0].scatter(
-            t_plot,
-            target_lc,
-            s=4,
-            c="0.65",
-            alpha=0.5,
-            linewidths=0,
-            rasterized=True,
-        )
-        axes2[0].errorbar(
-            bt_t,
-            by_t,
-            be_t,
-            fmt="o",
-            ms=5,
-            color="#2166ac",
-            elinewidth=1,
-            capsize=2,
-            zorder=3,
-        )
-        axes2[0].axhline(1, lw=0.8, ls="--", color="0.45")
-        axes2[0].set_ylabel("Diff. flux")
-        axes2[0].set_title(
-            f"{target}  ·  {target_filter}  ·  aperture {best_aperture}  ·  {day_date}",
-            fontsize=10,
-        )
-
-        # FWHM
-        fin = np.isfinite(fwhm_as)
-        bt_s, by_s, _ = _bin_lc(t_plot[fin], fwhm_as[fin])
-        axes2[1].scatter(
-            t_plot[fin],
-            fwhm_as[fin],
-            s=3,
-            c="0.7",
-            alpha=0.5,
-            linewidths=0,
-            rasterized=True,
-        )
-        axes2[1].plot(bt_s, by_s, "o-", ms=3, lw=0.9, color="#4393c3")
-        axes2[1].set_ylabel('FWHM (")')
-
-        # Sky background
-        fin = np.isfinite(sky_adu_s)
-        bt_s, by_s, _ = _bin_lc(t_plot[fin], sky_adu_s[fin])
-        axes2[2].scatter(
-            t_plot[fin],
-            sky_adu_s[fin],
-            s=3,
-            c="0.7",
-            alpha=0.5,
-            linewidths=0,
-            rasterized=True,
-        )
-        axes2[2].plot(bt_s, by_s, "o-", ms=3, lw=0.9, color="#762a83")
-        axes2[2].set_ylabel(r"Sky (ADU s$^{-1}$ px$^{-1}$)")
-
-        # Centroid drift dx and dy on the same panel
-        for y_arr, color, label in [
-            (data["dx"][_order], "#1b7837", "$\Delta x$"),
-            (data["dy"][_order], "#e08214", "$\Delta y$"),
-        ]:
-            fin = np.isfinite(y_arr)
-            bt_s, by_s, _ = _bin_lc(t_plot[fin], y_arr[fin])
-            axes2[3].scatter(
-                t_plot[fin],
-                y_arr[fin],
-                s=3,
-                alpha=0.35,
-                linewidths=0,
-                color=color,
-                rasterized=True,
-            )
-            axes2[3].plot(bt_s, by_s, "o-", ms=3, lw=0.9, color=color, label=label)
-        axes2[3].axhline(0, lw=0.7, ls="--", color="0.5")
-        axes2[3].set_ylabel("Centroid drift (px)")
-        axes2[3].legend(fontsize=8, frameon=False, ncol=2)
-
-        # Airmass
-        airmass = data["airmass"][_order]
-        fin = np.isfinite(airmass)
-        axes2[4].plot(t_plot[fin], airmass[fin], "o-", ms=3, lw=0.9, color="#636363")
-        axes2[4].set_ylabel("Airmass")
-        axes2[4].set_xlabel(f"JD − {jd0}")
-
-        for ax in axes2:
-            ax.tick_params(labelsize=9)
-
-        syst_path = run_dir / "systematics.pdf"
-        fig2.savefig(syst_path, bbox_inches="tight")
-        logger.info("Saved systematics figure to %s", syst_path)
-        plt.close(fig2)
+        build_pdf(run_dir)
 
         # =======================================================================
         # Optional: build the interactive HTML night report from the saved bundle

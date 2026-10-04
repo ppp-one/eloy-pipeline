@@ -9,7 +9,7 @@ stack PNGs it references) that shows, in the style of the SPECULOOS portal:
   * the night movie (encoded to mp4), whose playhead follows the cursor when you
     hover the light curve;
   * the target differential light curve (raw + binned);
-  * a systematics panel with a dropdown (fwhm, sky, dx, dy, airmass, and the
+  * a systematics panel with a dropdown (fwhm, sky, dx, dy, airmass, target peak, and the
     comparison-star light curves).
 
 The page renders with plotly.js loaded from a CDN, so no Python plotting library
@@ -458,6 +458,8 @@ def app_payload(
             "dx": jsonify(np.asarray(d["dx"], float)),
             "dy": jsonify(np.asarray(d["dy"], float)),
             "airmass": jsonify(np.asarray(d["airmass"], float)),
+            # Brightest pixel of the target per frame: watch for saturation.
+            "peak": jsonify(np.asarray(d["peak"], float)[:, target_index]),
         },
         "coords": jsonify(coords),
         "apRadii": jsonify(ap_radii_per_ap),
@@ -508,7 +510,7 @@ def render_html(meta, img_fig, lc_fig, app, movie_src):
     sbtns = "".join(
         f'<span class="hover-syst{" hovered" if key == "fwhm" else ""}" data-k="{key}" '
         f"onmouseenter=\"setSyst('{key}')\">{key}</span>"
-        for key in ["fwhm", "sky", "dx", "dy", "airmass", "alc"]
+        for key in ["fwhm", "sky", "dx", "dy", "airmass", "peak", "alc"]
     )
 
     meta_pills = "".join(
@@ -1138,6 +1140,7 @@ input[type=number]:focus {{ border-color: #bababa; box-shadow: 0 0 0 2px rgba(18
     dx:      'Δx (px)',
     dy:      'Δy (px)',
     airmass: 'Airmass',
+    peak:    'Target peak (ADU)',
     alc:     'ALC (rel. flux)',
   }};
 
