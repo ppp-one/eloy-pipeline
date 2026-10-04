@@ -821,101 +821,100 @@ def _bin_residual_score(lc: np.ndarray, t: np.ndarray, bin_minutes: float) -> fl
     return float(np.std(np.concatenate(residuals)))
 
 
+MAX_COMPARISONS = 30  # most comparison stars tried per aperture
+
+
+def differential_photometry(fluxes, target_index, max_comps=MAX_COMPARISONS):
+    """Differential light curves and comparison-star weights for every aperture.
+
+    Replaces ``eloy.flux.auto_diff``, which has two faults. It ranks the target
+    among the candidate comparison stars, so when the target is not the brightest
+    star the step that "adds" it changes nothing, the noise does not drop, and
+    the search stops (often with 1 comparison star). It also stops at the first
+    rise in noise. Here the target is left out of the ranking, and every count of
+    comparison stars from 1 to ``max_comps`` (in Broeg-weight order) is tried; the
+    count that gives the target the lowest white noise wins.
+
+    Args:
+        fluxes: Background-subtracted fluxes, shape ``(n_apertures, n_stars,
+            n_frames)``, frames in time order.
+        target_index: Index of the science target along the star axis.
+        max_comps: Largest number of comparison stars to try.
+
+    Returns:
+        ``(diffs, weights)`` with shapes ``(n_apertures, n_stars, n_frames)`` and
+        ``(n_apertures, n_stars)``; ``weights > 0`` marks the comparison stars.
+    """
+    diffs, weights = [], []
+    for f in fluxes:  # one aperture: (n_stars, n_frames)
+        norm = f / np.nanmean(f, axis=-1, keepdims=True)
+        w = flux.weights(norm)
+        candidates = [
+            s for s in np.argsort(w)[::-1] if s != target_index and w[s] > 0
+        ][:max_comps]
+        white_noise = utils.binned_nanstd(norm)
+        best_w, best_noise = None, np.inf
+        for k in range(1, len(candidates) + 1):
+            trial = np.zeros_like(w)
+            trial[candidates[:k]] = w[candidates[:k]]
+            noise = np.take(white_noise(flux.diff(norm, trial)), target_index, axis=-1)[0]
+            if np.isfinite(noise) and noise < best_noise:
+                best_w, best_noise = trial, noise
+        if best_w is None:  # no usable comparison set: fall back to all candidates
+            best_w = np.zeros_like(w)
+            best_w[candidates] = w[candidates]
+        diffs.append(flux.diff(norm, best_w).reshape(f.shape))
+        weights.append(best_w)
+    return np.array(diffs), np.array(weights)
+
+
 def optimal_aperture(
     diffs: np.ndarray,
     target_index: int,
     time: np.ndarray,
-    weights: np.ndarray,
     bin_minutes: float = 10.0,
 ) -> int:
-    """Select the aperture that minimises noise without penalising variability.
+    """Select the aperture that gives the target the least short-term noise.
 
-    The decision is driven by the comparison stars, which are not astrophysically
-    variable, so their noise versus aperture gives an uncontaminated view of
-    aperture quality (read-noise-dominated at small apertures, sky-dominated at
-    large ones, optimal in between). Two metrics are computed for the comparison
-    ensemble at each aperture (point-to-point scatter and within-bin residual
-    scatter); apertures are ranked on each and the lowest combined rank wins.
+    Two metrics are computed on the target's light curve at each aperture:
+    point-to-point scatter and the scatter within ``bin_minutes`` bins. Both only
+    see noise on time scales of a few minutes, so slow astrophysical signals
+    (transits lasting hours, pulsations of ~1 h) barely change them. Apertures are
+    ranked on each metric and the lowest combined rank wins.
 
-    The same metrics are computed for the target as a cross-check and logged. If
-    they strongly disagree with the comparison result a warning is emitted, but
-    the comparison result is kept because the target's own light curve may
-    contain real astrophysical signal.
+    The comparison stars are not used to score apertures: each aperture has its
+    own comparison set, so their median noise mostly reflects which stars are in
+    the set, not the aperture.
 
     Args:
         diffs: Differential light curves, shape ``(n_apertures, n_stars,
             n_frames)``.
         target_index: Column index of the science target in the star axis.
         time: JD timestamps, shape ``(n_frames,)``. Need not be sorted.
-        weights: Per-aperture comparison-star weights, shape ``(n_apertures,
-            n_stars)``. Stars with ``weight > 0`` are treated as comparisons.
-        bin_minutes: Width of the time bins used for the within-bin residual
-            metric.
+        bin_minutes: Width of the time bins used for the within-bin metric.
 
     Returns:
         Index of the chosen aperture along the aperture axis of ``diffs``.
     """
-    n_ap, n_stars, _ = diffs.shape
-
     order = np.argsort(time)
     t = time[order]
-    D = diffs[:, :, order]  # (n_ap, n_stars, n_frames)
+    lcs = diffs[:, target_index][:, order]  # (n_apertures, n_frames)
 
-    comp_ptp = np.full(n_ap, np.inf)
-    comp_bin = np.full(n_ap, np.inf)
-    tgt_ptp = np.full(n_ap, np.inf)
-    tgt_bin = np.full(n_ap, np.inf)
-
-    for ap in range(n_ap):
-        tgt_ptp[ap] = _ptp_score(D[ap, target_index])
-        tgt_bin[ap] = _bin_residual_score(D[ap, target_index], t, bin_minutes)
-
-        comp_idx = [
-            s for s in range(n_stars) if s != target_index and weights[ap, s] > 0
-        ]
-        if not comp_idx:
-            continue
-
-        ptp_vals = [_ptp_score(D[ap, s]) for s in comp_idx]
-        bin_vals = [_bin_residual_score(D[ap, s], t, bin_minutes) for s in comp_idx]
-
-        finite_ptp = [v for v in ptp_vals if np.isfinite(v)]
-        finite_bin = [v for v in bin_vals if np.isfinite(v)]
-        if finite_ptp:
-            comp_ptp[ap] = float(np.median(finite_ptp))
-        if finite_bin:
-            comp_bin[ap] = float(np.median(finite_bin))
+    ptp = np.array([_ptp_score(lc) for lc in lcs])
+    binned = np.array([_bin_residual_score(lc, t, bin_minutes) for lc in lcs])
 
     def _rank(scores: np.ndarray) -> np.ndarray:
-        """Dense rank: inf values get the worst (highest) rank."""
-        return np.argsort(np.argsort(scores))
+        """Dense rank: inf/NaN values get the worst (highest) rank."""
+        return np.argsort(np.argsort(np.nan_to_num(scores, nan=np.inf)))
 
-    # Primary: rank apertures by comparison-ensemble noise.
-    comp_best = int(np.argmin(_rank(comp_ptp) + _rank(comp_bin)))
-
-    # Cross-check: what would the target alone prefer?
-    tgt_best = int(np.argmin(_rank(tgt_ptp) + _rank(tgt_bin)))
-
-    if abs(comp_best - tgt_best) > 5:
-        logger.warning(
-            "Aperture selection: comparison ensemble prefers #%d, "
-            "target alone prefers #%d. Using comparison result — "
-            "target LC may contain astrophysical signal.",
-            comp_best,
-            tgt_best,
-        )
-
+    best = int(np.argmin(_rank(ptp) + _rank(binned)))
     logger.info(
-        "Optimal aperture: %d  "
-        "(comp PTP %.4f, comp bin-residual %.4f; "
-        "target PTP %.4f, target bin-residual %.4f)",
-        comp_best,
-        comp_ptp[comp_best],
-        comp_bin[comp_best],
-        tgt_ptp[comp_best],
-        tgt_bin[comp_best],
+        "Optimal aperture: %d  (target point-to-point %.4f, within-bin %.4f)",
+        best,
+        ptp[best],
+        binned[best],
     )
-    return comp_best
+    return best
 
 
 def _bin_lc(t_arr, y_arr, bin_min=10.0):
@@ -1327,7 +1326,7 @@ def main():
         movie = np.array(movie)  # (n_frames, h, w) uint8
 
         # Put frames in time order. Workers return them in the order they finish,
-        # which changes between runs, and flux.auto_diff measures noise from
+        # which changes between runs, and differential_photometry measures noise from
         # consecutive frames, so its comparison weights depend on this order.
         order = np.argsort(data["time"])
         for k in data:
@@ -1347,11 +1346,11 @@ def main():
         fluxes = (data["fluxes"] - data["bkg"]).T
 
         # Differential photometry against an automatically-chosen comparison set.
-        diffs, weights = flux.auto_diff(fluxes, target_index)
+        diffs, weights = differential_photometry(fluxes, target_index)
 
         # Pick the aperture that minimises the target's light-curve scatter.
         best_aperture = optimal_aperture(
-            diffs, target_index, data["time"], weights, bin_minutes=10.0
+            diffs, target_index, data["time"], bin_minutes=10.0
         )
         logger.info("Best aperture index: %d", best_aperture)
 
