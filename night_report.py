@@ -1218,6 +1218,17 @@ input[type=number]:focus {{ border-color: #bababa; box-shadow: 0 0 0 2px rgba(18
     + 'background:var(--text-muted);z-index:5;transition:opacity .08s;';
   lcDiv.appendChild(_spike);
 
+  // Movie frames are in time order, so frame i shows the i-th sorted time.
+  const _frameTimes = D.time.slice().sort((a, b) => a - b);
+  function _nearestFrame(jd) {{
+    let lo = 0, hi = _frameTimes.length - 1;
+    while (lo < hi) {{  // first frame at or after jd
+      const mid = (lo + hi) >> 1;
+      if (_frameTimes[mid] < jd) lo = mid + 1; else hi = mid;
+    }}
+    return (lo > 0 && jd - _frameTimes[lo - 1] < _frameTimes[lo] - jd) ? lo - 1 : lo;
+  }}
+
   lcDiv.addEventListener('mousemove', function(evt) {{
     const fl = lcDiv._fullLayout;
     if (!fl || !fl.xaxis2) return;
@@ -1232,9 +1243,11 @@ input[type=number]:focus {{ border-color: #bababa; box-shadow: 0 0 0 2px rgba(18
     _spike.style.opacity = 1;
     if (vid && vid.duration) {{
       const frac = Math.max(0, Math.min(1, px / xax._length));
-      const x_val = xax.range[0] + frac * (xax.range[1] - xax.range[0]);  // JD - jd0
-      const f = (x_val + D.jd0 - D.t0) / (D.t1 - D.t0);
-      vid.currentTime = Math.max(0, Math.min(1, f)) * vid.duration;
+      const jd = xax.range[0] + frac * (xax.range[1] - xax.range[0]) + D.jd0;
+      // The movie has one frame per exposure, so map the cursor to the nearest
+      // frame in time, not linearly over the night (gaps hold no frames).
+      const i = _nearestFrame(jd);
+      vid.currentTime = Math.min((i + 0.5) / _frameTimes.length, 1) * vid.duration;
     }}
   }});
   lcDiv.addEventListener('mouseleave', function() {{ _spike.style.opacity = 0; }});
