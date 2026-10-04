@@ -1210,20 +1210,19 @@ def main():
             data[k] = np.array(v)
         movie = np.array(movie)  # (n_frames, h, w) uint8
 
-        # Persist the raw photometry products for later analysis.
+        # Put frames in time order. Workers return them in the order they finish,
+        # which changes between runs, and flux.auto_diff measures noise from
+        # consecutive frames, so its comparison weights depend on this order.
+        order = np.argsort(data["time"])
+        for k in data:
+            data[k] = data[k][order]
+        if len(movie) == len(order):
+            movie = movie[order]
+
         telescope_name = ref_header.get(KW_TELESCOP, "unknown")
         run_dir = run_output_dir(
             output_dir, target, day_date, telescope_name, target_filter
         )
-        output_file = run_dir / "photometry.npz"
-        np.savez(
-            output_file,
-            platescale=pixel_scale * 3600,
-            read_noise=read_noise,
-            dark_current=dark_current,
-            **data,
-        )
-        logger.info("Saved photometry to %s", output_file)
 
         # =======================================================================
         # Differential photometry
@@ -1240,7 +1239,6 @@ def main():
         )
         logger.info("Best aperture index: %d", best_aperture)
 
-        logger.info("Saving night-report bundle for night_report.py...")
         # Artificial (comparison) light curve per aperture: the weighted mean of the
         # normalised comparison fluxes used to detrend the target (Broeg 2005). The
         # comparison weights differ per aperture, so this is shape (apertures, frames).
@@ -1251,22 +1249,18 @@ def main():
         )
 
         # =======================================================================
-        # Save the night-report bundle (data + images + movie) for night_report.py
+        # Save results: each array goes into exactly one file
         # =======================================================================
-        report_file = run_dir / "night_report.npz"
+        # photometry.npz: everything measured or derived, at full precision (small).
+        photometry_file = run_dir / "photometry.npz"
         np.savez_compressed(
-            report_file,
-            stack=stack,
-            master_bias=BIAS,
-            master_dark=DARK,
-            master_flat=FLAT,
+            photometry_file,
             ref_coords=ref_coords,
             target_index=target_index,
             diffs=diffs,
             weights=weights,
             alc=alc,
             best_aperture=best_aperture,
-            movie=movie,
             target=target,
             date=str(day_date),
             band=target_filter,
@@ -1276,10 +1270,23 @@ def main():
             dark_current=dark_current,
             **data,
         )
+        logger.info("Saved photometry to %s", photometry_file)
+
+        # images.npz: the pictures the report shows. float32 keeps ~7 significant
+        # digits, far finer than the noise, at half the size of float64.
+        images_file = run_dir / "images.npz"
+        np.savez_compressed(
+            images_file,
+            stack=stack.astype(np.float32),
+            master_bias=np.asarray(BIAS, dtype=np.float32),
+            master_dark=np.asarray(DARK, dtype=np.float32),
+            master_flat=np.asarray(FLAT, dtype=np.float32),
+            movie=movie,
+        )
         logger.info(
-            'Saved night-report bundle to %s (visualise with `uv run night_report.py "%s"`)',
-            report_file,
-            report_file,
+            'Saved images to %s (build the report with `uv run night_report.py "%s"`)',
+            images_file,
+            run_dir,
         )
 
         # =======================================================================
@@ -1289,8 +1296,8 @@ def main():
 
         t_jd = data["time"]
         jd0 = int(np.floor(t_jd.min()))
-        # Sort into chronological order once; workers return frames in completion
-        # order (as_completed), not observation order.
+        # Frames are already time-sorted above; this keeps the plots safe if that
+        # ever changes.
         _order = np.argsort(t_jd)
         t_plot = (t_jd - jd0)[_order]
 
@@ -1503,7 +1510,7 @@ def main():
             # night_report's (imageio/PIL) imports on every spawn.
             from night_report import build_report
 
-            build_report(report_file)
+            build_report(run_dir)
 
         logger.info("All outputs for filter '%s' are in %s/", target_filter, run_dir)
 

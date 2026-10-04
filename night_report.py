@@ -1,7 +1,7 @@
 """Build an interactive night-report web page from a pipeline report bundle.
 
-Reads the ``night_report.npz`` bundle that ``pipeline.py`` writes to each run
-folder and writes an HTML page (plus a sibling ``*_assets`` folder holding the movie and
+Reads a ``pipeline.py`` run folder (``photometry.npz`` + ``images.npz``) and
+writes an HTML page (plus a sibling ``*_assets`` folder holding the movie and
 stack PNGs it references) that shows, in the style of the SPECULOOS portal:
 
   * the co-added stack with the target/comparison stars overlaid, plus buttons
@@ -16,7 +16,7 @@ The page renders with plotly.js loaded from a CDN, so no Python plotting library
 is required.
 
 Usage:
-    uv run night_report.py results/<target>/<date>_<telescope>_<filter>/night_report.npz [-o report.html]
+    uv run night_report.py results/<target>/<date>_<telescope>_<filter>/ [-o report.html]
 """
 
 import argparse
@@ -1253,16 +1253,36 @@ input[type=number]:focus {{ border-color: #bababa; box-shadow: 0 0 0 2px rgba(18
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def build_report(npz_path, out_html=None, fps=15, platescale=None, crf=28, keyint=1):
-    npz_path = Path(npz_path)
-    out_html = Path(out_html) if out_html else npz_path.with_suffix(".html")
+def load_run(path):
+    """Load a pipeline run as one dict; return it with the default report path.
+
+    ``path`` is a run folder, or any ``.npz`` inside one. A run folder holds
+    ``photometry.npz`` (measurements, light curves, metadata) and ``images.npz``
+    (stack, master frames, movie). An older single-file bundle, which holds
+    both, is also accepted.
+    """
+    path = Path(path)
+    if path.is_file():
+        with np.load(path, allow_pickle=True) as z:
+            if "stack" in z.files and "diffs" in z.files:  # old single-file bundle
+                return dict(z), path.with_suffix(".html")
+        path = path.parent
+    d = {}
+    for name in ("photometry.npz", "images.npz"):
+        with np.load(path / name, allow_pickle=True) as z:
+            d.update(z)
+    return d, path / "night_report.html"
+
+
+def build_report(run_path, out_html=None, fps=15, platescale=None, crf=28, keyint=1):
+    d, default_html = load_run(run_path)
+    out_html = Path(out_html) if out_html else default_html
     # The movie and stack images are written here and referenced by relative URL,
     # so the HTML stays small instead of carrying everything as base64.
     asset_dir = out_html.with_name(out_html.stem + "_assets")
     asset_rel = asset_dir.name
     asset_dir.mkdir(parents=True, exist_ok=True)
 
-    d = dict(np.load(npz_path, allow_pickle=True))
     if platescale is None:
         platescale = float(d["platescale"]) if "platescale" in d else DEFAULT_PLATESCALE
 
@@ -1362,9 +1382,9 @@ def main():
         description="Build an interactive night-report web page."
     )
     ap.add_argument(
-        "npz", help="night_report.npz bundle from a pipeline.py run folder"
+        "run", help="pipeline.py run folder (or a .npz file inside it)"
     )
-    ap.add_argument("-o", "--out", help="output HTML path (default: alongside the npz)")
+    ap.add_argument("-o", "--out", help="output HTML path (default: night_report.html in the run folder)")
     ap.add_argument("--fps", type=int, default=15, help="night-movie frame rate")
     ap.add_argument(
         "--crf",
@@ -1388,7 +1408,7 @@ def main():
     )
     args = ap.parse_args()
     build_report(
-        args.npz, args.out, args.fps, args.platescale, crf=args.crf, keyint=args.keyint
+        args.run, args.out, args.fps, args.platescale, crf=args.crf, keyint=args.keyint
     )
 
 

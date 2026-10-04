@@ -73,8 +73,8 @@ first in the run folder, so nights sort in order.
 results/
 └── WASP-33b/
     └── 2026-10-02_ETH-Hongg_i/
-        ├── photometry.npz        # per-frame fluxes, backgrounds, centroids, metadata
-        ├── night_report.npz      # all of that + stack, master frames, light curves, movie
+        ├── photometry.npz        # fluxes, backgrounds, light curves, comparison weights, metadata
+        ├── images.npz            # co-added stack, master bias/dark/flat (float32), movie frames
         ├── lightcurve.pdf        # target and comparison-star light curves
         ├── systematics.pdf       # FWHM, sky, centroid drift, airmass
         ├── night_report.html     # interactive report (--report only)
@@ -85,7 +85,7 @@ A second run of the same target, night, telescope and filter overwrites that fol
 
 ## night_report.py
 
-Reads a run folder's `night_report.npz` and writes an HTML page (Plotly and D3 from a CDN)
+Reads a run folder (`photometry.npz` + `images.npz`) and writes an HTML page (Plotly and D3 from a CDN)
 you can open in any browser, with no server. The movie and stack images go in a
 sibling `<report>_assets/` folder that the page references, so keep the two
 together when you move or share a report. It gives you:
@@ -97,7 +97,7 @@ together when you move or share a report. It gives you:
 - a light/dark theme toggle.
 
 ```bash
-uv run night_report.py results/<target>/<date>_<telescope>_<filter>/night_report.npz \
+uv run night_report.py results/<target>/<date>_<telescope>_<filter>/ \
   [-o report.html] \
   [--fps 15] \
   [--crf 28] \      # movie quality: higher number = smaller file
