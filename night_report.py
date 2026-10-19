@@ -1412,7 +1412,7 @@ def build_report(run_path, out_html=None, fps=15, platescale=None, crf=28, keyin
     }
 
     html = render_html(meta, img_fig, lc_fig, app, movie_src)
-    out_html.write_text(html)
+    out_html.write_text(html, encoding='utf-8')
     logger.info(
         "Wrote report %s (%.2f MB) + assets in %s/",
         out_html,
